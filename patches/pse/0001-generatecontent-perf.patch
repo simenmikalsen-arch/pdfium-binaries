@@ -1,0 +1,366 @@
+diff --git a/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp b/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp
+index b70ec55..f5fdb62 100644
+--- a/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp
++++ b/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp
+@@ -138,9 +138,12 @@ std::vector<ByteString> FindKeysToRestore(
+     return {};
+   }
+ 
++  // Use a set, as a linear search through `keys` for every key in use is
++  // quadratic.
++  const std::set<ByteString> existing_keys(keys.begin(), keys.end());
+   std::vector<ByteString> missing_keys;
+   for (const ByteString& key : *resource_in_use_of_current_type) {
+-    if (!pdfium::Contains(keys, key)) {
++    if (!pdfium::Contains(existing_keys, key)) {
+       missing_keys.push_back(key);
+     }
+   }
+@@ -218,6 +221,27 @@ void RemoveOrRestoreUnusedResources(
+   }
+ }
+ 
++// Returns whether the `type` resource dictionary in `resources` maps `name` to
++// a reference to `resource`. If so, `name` can keep being used for `resource`.
++bool IsResourceNameMappedTo(const CPDF_Dictionary* resources,
++                            ByteStringView type,
++                            const ByteString& name,
++                            const CPDF_Object* resource) {
++  const uint32_t resource_obj_num = resource->GetObjNum();
++  if (!resources || name.IsEmpty() || resource_obj_num == 0) {
++    return false;
++  }
++
++  RetainPtr<const CPDF_Dictionary> resource_dict = resources->GetDictFor(type);
++  if (!resource_dict) {
++    return false;
++  }
++
++  RetainPtr<const CPDF_Reference> ref =
++      ToReference(resource_dict->GetObjectFor(name.AsStringView()));
++  return ref && ref->GetRefObjNum() == resource_obj_num;
++}
++
+ bool IsPageResourceShared(CPDF_Document* doc,
+                           RetainPtr<const CPDF_Dictionary> page_dict,
+                           RetainPtr<const CPDF_Dictionary> resources_dict) {
+@@ -512,7 +536,7 @@ void CPDF_PageContentGenerator::UpdateResourcesDict() {
+ 
+ ByteString CPDF_PageContentGenerator::RealizeResource(
+     const CPDF_Object* pResource,
+-    ByteStringView type) const {
++    ByteStringView type) {
+   DCHECK(pResource);
+   if (!obj_holder_->GetResources()) {
+     obj_holder_->SetResources(document_->NewIndirect<CPDF_Dictionary>());
+@@ -528,20 +552,25 @@ ByteString CPDF_PageContentGenerator::RealizeResource(
+   auto it = all_removed_resources_map.find(type);
+   const CPDF_PageObjectHolder::RemovedResourceMap* removed_resource_map =
+       it != all_removed_resources_map.end() ? &it->second : nullptr;
++
++  // Resume the search where the previous search for `type` stopped, instead of
++  // starting from 1 every time, which is quadratic in the number of resources.
++  // Entries do not leave `resource_dict` or `removed_resource_map` before
++  // UpdateResourcesDict(), so the names skipped so far are still taken. Even if
++  // one became free again, skipping it would be harmless.
++  int& idnum = last_resource_idnum_[ByteString(type)];
+   ByteString name;
+-  int idnum = 1;
+   while (true) {
++    ++idnum;
+     name = ByteString::Format("FX%c%d", type[0], idnum);
+     // Avoid name collisions with existing `resource_dict` entries.
+     if (resource_dict->KeyExist(name.AsStringView())) {
+-      idnum++;
+       continue;
+     }
+ 
+     // Also avoid collisions with entries in `removed_resource_map`, since those
+     // entries may move back into `resource_dict`.
+     if (removed_resource_map && pdfium::Contains(*removed_resource_map, name)) {
+-      idnum++;
+       continue;
+     }
+ 
+@@ -688,7 +717,13 @@ void CPDF_PageContentGenerator::ProcessImage(fxcrt::ostringstream* buf,
+     pImage->ConvertStreamToIndirectObject();
+   }
+ 
+-  ByteString name = RealizeResource(pStream, "XObject");
++  // Keep the existing name if it still refers to the image. Otherwise, adding
++  // a new name for every image on every regeneration bloats the resources.
++  ByteString name = pImageObj->GetResourceName();
++  if (!IsResourceNameMappedTo(obj_holder_->GetResources().Get(), "XObject",
++                              name, pStream.Get())) {
++    name = RealizeResource(pStream.Get(), "XObject");
++  }
+   pImageObj->SetResourceName(name);
+ 
+   if (bWasInline) {
+@@ -717,7 +752,12 @@ void CPDF_PageContentGenerator::ProcessForm(fxcrt::ostringstream* buf,
+ 
+   RetainPtr<const CPDF_Stream> pStream = pFormObj->form()->GetStream();
+   CHECK(pStream);
+-  ByteString name = RealizeResource(pStream.Get(), "XObject");
++  // Keep the existing name if it still refers to the form, as for images.
++  ByteString name = pFormObj->GetResourceName();
++  if (!IsResourceNameMappedTo(obj_holder_->GetResources().Get(), "XObject",
++                              name, pStream.Get())) {
++    name = RealizeResource(pStream.Get(), "XObject");
++  }
+   pFormObj->SetResourceName(name);
+ 
+   ProcessGraphics(buf, pFormObj);
+@@ -913,7 +953,7 @@ void CPDF_PageContentGenerator::ProcessDefaultGraphics(
+   *buf << "/" << PDF_NameEncode(default_graphics_name_) << " gs ";
+ }
+ 
+-ByteString CPDF_PageContentGenerator::GetOrCreateDefaultGraphics() const {
++ByteString CPDF_PageContentGenerator::GetOrCreateDefaultGraphics() {
+   GraphicsData defaultGraphics;
+   defaultGraphics.fillAlpha = 1.0f;
+   defaultGraphics.strokeAlpha = 1.0f;
+diff --git a/core/fpdfapi/edit/cpdf_pagecontentgenerator.h b/core/fpdfapi/edit/cpdf_pagecontentgenerator.h
+index b37d06b..ae09fd5 100644
+--- a/core/fpdfapi/edit/cpdf_pagecontentgenerator.h
++++ b/core/fpdfapi/edit/cpdf_pagecontentgenerator.h
+@@ -46,9 +46,9 @@ class CPDF_PageContentGenerator {
+   void ProcessGraphics(fxcrt::ostringstream* buf, CPDF_PageObject* pPageObj);
+   void ProcessDefaultGraphics(fxcrt::ostringstream* buf);
+   void ProcessText(fxcrt::ostringstream* buf, CPDF_TextObject* pTextObj);
+-  ByteString GetOrCreateDefaultGraphics() const;
++  ByteString GetOrCreateDefaultGraphics();
+   ByteString RealizeResource(const CPDF_Object* pResource,
+-                             ByteStringView type) const;
++                             ByteStringView type);
+   const CPDF_ContentMarks* ProcessContentMarks(fxcrt::ostringstream* buf,
+                                                const CPDF_PageObject* pPageObj,
+                                                const CPDF_ContentMarks* pPrev);
+@@ -77,6 +77,11 @@ class CPDF_PageContentGenerator {
+   UnownedPtr<CPDF_Document> const document_;
+   std::vector<UnownedPtr<CPDF_PageObject>> page_objects_;
+   ByteString default_graphics_name_;
++
++  // Key: The resource type.
++  // Value: The number in the last resource name RealizeResource() tried for
++  // that type.
++  std::map<ByteString, int> last_resource_idnum_;
+ };
+ 
+ #endif  // CORE_FPDFAPI_EDIT_CPDF_PAGECONTENTGENERATOR_H_
+diff --git a/core/fpdfapi/edit/cpdf_pagecontentgenerator_unittest.cpp b/core/fpdfapi/edit/cpdf_pagecontentgenerator_unittest.cpp
+index 9ccb871..77a6546 100644
+--- a/core/fpdfapi/edit/cpdf_pagecontentgenerator_unittest.cpp
++++ b/core/fpdfapi/edit/cpdf_pagecontentgenerator_unittest.cpp
+@@ -7,11 +7,13 @@
+ #include <iterator>
+ #include <memory>
+ #include <utility>
++#include <vector>
+ 
+ #include "core/fpdfapi/font/cpdf_font.h"
+ #include "core/fpdfapi/page/cpdf_colorspace.h"
+ #include "core/fpdfapi/page/cpdf_docpagedata.h"
+ #include "core/fpdfapi/page/cpdf_form.h"
++#include "core/fpdfapi/page/cpdf_formobject.h"
+ #include "core/fpdfapi/page/cpdf_page.h"
+ #include "core/fpdfapi/page/cpdf_pathobject.h"
+ #include "core/fpdfapi/page/cpdf_textobject.h"
+@@ -23,11 +25,38 @@
+ #include "core/fpdfapi/parser/cpdf_parser.h"
+ #include "core/fpdfapi/parser/cpdf_reference.h"
+ #include "core/fpdfapi/parser/cpdf_stream.h"
++#include "core/fpdfapi/parser/cpdf_stream_acc.h"
+ #include "core/fpdfapi/parser/cpdf_test_document.h"
+ #include "core/fxcrt/data_vector.h"
+ #include "core/fxge/cfx_fillrenderoptions.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
++namespace {
++
++RetainPtr<CPDF_Stream> AddStream(CPDF_Document* doc,
++                                 ByteStringView contents,
++                                 RetainPtr<CPDF_Dictionary> dict) {
++  pdfium::span<const uint8_t> data = contents.unsigned_span();
++  return doc->NewIndirect<CPDF_Stream>(
++      DataVector<uint8_t>(data.begin(), data.end()), std::move(dict));
++}
++
++RetainPtr<CPDF_Stream> AddFormXObject(CPDF_Document* doc) {
++  auto dict = pdfium::MakeRetain<CPDF_Dictionary>();
++  dict->SetNewFor<CPDF_Name>("Type", "XObject");
++  dict->SetNewFor<CPDF_Name>("Subtype", "Form");
++  dict->SetRectFor("BBox", CFX_FloatRect(0, 0, 10, 10));
++  return AddStream(doc, "0 0 10 10 re f", std::move(dict));
++}
++
++ByteString GetStreamData(RetainPtr<const CPDF_Stream> stream) {
++  auto stream_acc = pdfium::MakeRetain<CPDF_StreamAcc>(std::move(stream));
++  stream_acc->LoadAllDataFiltered();
++  return ByteString(ByteStringView(stream_acc->GetSpan()));
++}
++
++}  // namespace
++
+ class CPDFPageContentGeneratorTest : public TestWithPageModule {
+  protected:
+   void TestProcessPath(CPDF_PageContentGenerator* pGen,
+@@ -472,3 +501,158 @@ TEST_F(CPDFPageContentGeneratorTest, ProcessContentMarksWithProperties) {
+ 
+   EXPECT_TRUE(content.Contains("/M1 /Property#20Name#20With#20Space BDC"));
+ }
++
++TEST_F(CPDFPageContentGeneratorTest, KeepXObjectNames) {
++  auto doc = std::make_unique<CPDF_TestDocument>();
++  doc->CreateNewDoc();
++  RetainPtr<CPDF_Stream> form0 = AddFormXObject(doc.get());
++  RetainPtr<CPDF_Stream> form1 = AddFormXObject(doc.get());
++
++  RetainPtr<CPDF_Dictionary> page_dict = doc->CreateNewPage(0);
++  RetainPtr<CPDF_Dictionary> xobjects =
++      page_dict->SetNewFor<CPDF_Dictionary>("Resources")
++          ->SetNewFor<CPDF_Dictionary>("XObject");
++  xobjects->SetNewFor<CPDF_Reference>("Fm0", doc.get(), form0->GetObjNum());
++  xobjects->SetNewFor<CPDF_Reference>("Fm1", doc.get(), form1->GetObjNum());
++  RetainPtr<CPDF_Stream> contents =
++      AddStream(doc.get(),
++                "q /Fm0 Do Q q 1 0 0 1 20 0 cm /Fm1 Do Q "
++                "q 1 0 0 1 40 0 cm /Fm0 Do Q",
++                pdfium::MakeRetain<CPDF_Dictionary>());
++  page_dict->SetNewFor<CPDF_Reference>("Contents", doc.get(),
++                                       contents->GetObjNum());
++
++  auto page = pdfium::MakeRetain<CPDF_Page>(doc.get(), page_dict);
++  page->ParseContent();
++  ASSERT_EQ(3u, page->GetPageObjectCount());
++
++  // Regenerate the content more than once. Each regeneration used to give all
++  // the XObjects new names.
++  for (int i = 0; i < 3; ++i) {
++    for (size_t j = 0; j < page->GetPageObjectCount(); ++j) {
++      page->GetPageObjectByIndex(j)->SetDirty(true);
++    }
++    CPDF_PageContentGenerator generator(page.Get());
++    generator.GenerateContent();
++
++    EXPECT_EQ("Fm0", page->GetPageObjectByIndex(0)->GetResourceName());
++    EXPECT_EQ("Fm1", page->GetPageObjectByIndex(1)->GetResourceName());
++    EXPECT_EQ("Fm0", page->GetPageObjectByIndex(2)->GetResourceName());
++    RetainPtr<const CPDF_Dictionary> xobjects_after =
++        page->GetResources()->GetDictFor("XObject");
++    ASSERT_TRUE(xobjects_after);
++    EXPECT_EQ((std::vector<ByteString>{"Fm0", "Fm1"}),
++              xobjects_after->GetKeys());
++    const auto& removed_resources = page->all_removed_resources_map();
++    auto removed_it = removed_resources.find(ByteStringView("XObject"));
++    EXPECT_TRUE(removed_it == removed_resources.end() ||
++                removed_it->second.empty());
++
++    const ByteString content = GetStreamData(contents);
++    EXPECT_TRUE(content.Contains("/Fm0 Do"));
++    EXPECT_TRUE(content.Contains("/Fm1 Do"));
++    EXPECT_FALSE(content.Contains("/FXX"));
++  }
++}
++
++TEST_F(CPDFPageContentGeneratorTest, RenameXObjectWhenNameRefersToOtherObject) {
++  auto doc = std::make_unique<CPDF_TestDocument>();
++  doc->CreateNewDoc();
++  RetainPtr<CPDF_Stream> form0 = AddFormXObject(doc.get());
++  RetainPtr<CPDF_Stream> form1 = AddFormXObject(doc.get());
++
++  RetainPtr<CPDF_Dictionary> page_dict = doc->CreateNewPage(0);
++  RetainPtr<CPDF_Dictionary> xobjects =
++      page_dict->SetNewFor<CPDF_Dictionary>("Resources")
++          ->SetNewFor<CPDF_Dictionary>("XObject");
++  xobjects->SetNewFor<CPDF_Reference>("Fm0", doc.get(), form0->GetObjNum());
++  RetainPtr<CPDF_Stream> contents = AddStream(
++      doc.get(), "q /Fm0 Do Q", pdfium::MakeRetain<CPDF_Dictionary>());
++  page_dict->SetNewFor<CPDF_Reference>("Contents", doc.get(),
++                                       contents->GetObjNum());
++
++  auto page = pdfium::MakeRetain<CPDF_Page>(doc.get(), page_dict);
++  page->ParseContent();
++  ASSERT_EQ(1u, page->GetPageObjectCount());
++
++  // After parsing, "Fm0" no longer refers to the form the page object draws.
++  xobjects->SetNewFor<CPDF_Reference>("Fm0", doc.get(), form1->GetObjNum());
++  page->GetPageObjectByIndex(0)->SetDirty(true);
++  CPDF_PageContentGenerator generator(page.Get());
++  generator.GenerateContent();
++
++  EXPECT_EQ("FXX1", page->GetPageObjectByIndex(0)->GetResourceName());
++  RetainPtr<const CPDF_Dictionary> xobjects_after =
++      page->GetResources()->GetDictFor("XObject");
++  ASSERT_TRUE(xobjects_after);
++  EXPECT_EQ((std::vector<ByteString>{"FXX1"}), xobjects_after->GetKeys());
++  RetainPtr<const CPDF_Reference> ref =
++      ToReference(xobjects_after->GetObjectFor("FXX1"));
++  ASSERT_TRUE(ref);
++  EXPECT_EQ(form0->GetObjNum(), ref->GetRefObjNum());
++
++  const ByteString content = GetStreamData(contents);
++  EXPECT_TRUE(content.Contains("/FXX1 Do"));
++  EXPECT_FALSE(content.Contains("/Fm0"));
++}
++
++TEST_F(CPDFPageContentGeneratorTest, NewXObjectNamesSkipTakenNames) {
++  auto doc = std::make_unique<CPDF_TestDocument>();
++  doc->CreateNewDoc();
++  RetainPtr<CPDF_Stream> form0 = AddFormXObject(doc.get());
++
++  RetainPtr<CPDF_Dictionary> page_dict = doc->CreateNewPage(0);
++  RetainPtr<CPDF_Dictionary> xobjects =
++      page_dict->SetNewFor<CPDF_Dictionary>("Resources")
++          ->SetNewFor<CPDF_Dictionary>("XObject");
++  xobjects->SetNewFor<CPDF_Reference>("FXX2", doc.get(), form0->GetObjNum());
++  RetainPtr<CPDF_Stream> contents = AddStream(
++      doc.get(), "q /FXX2 Do Q", pdfium::MakeRetain<CPDF_Dictionary>());
++  page_dict->SetNewFor<CPDF_Reference>("Contents", doc.get(),
++                                       contents->GetObjNum());
++
++  auto page = pdfium::MakeRetain<CPDF_Page>(doc.get(), page_dict);
++  page->ParseContent();
++  ASSERT_EQ(1u, page->GetPageObjectCount());
++
++  // Pretend "FXX4" got removed from the resources earlier. It may get restored,
++  // so new names must not use it either.
++  page->all_removed_resources_map()["XObject"]["FXX4"] =
++      pdfium::MakeRetain<CPDF_Reference>(doc.get(), form0->GetObjNum());
++
++  std::vector<RetainPtr<CPDF_Stream>> new_forms;
++  for (int i = 0; i < 3; ++i) {
++    new_forms.push_back(AddFormXObject(doc.get()));
++    auto form_obj = std::make_unique<CPDF_FormObject>(
++        CPDF_PageObject::kNoContentStream,
++        std::make_unique<CPDF_Form>(doc.get(), nullptr, new_forms.back()),
++        CFX_Matrix());
++    form_obj->SetDirty(true);
++    page->AppendPageObject(std::move(form_obj));
++  }
++
++  CPDF_PageContentGenerator generator(page.Get());
++  generator.GenerateContent();
++
++  // The new names are the lowest free ones, in page object order.
++  ASSERT_EQ(4u, page->GetPageObjectCount());
++  EXPECT_EQ("FXX2", page->GetPageObjectByIndex(0)->GetResourceName());
++  EXPECT_EQ("FXX1", page->GetPageObjectByIndex(1)->GetResourceName());
++  EXPECT_EQ("FXX3", page->GetPageObjectByIndex(2)->GetResourceName());
++  EXPECT_EQ("FXX5", page->GetPageObjectByIndex(3)->GetResourceName());
++
++  RetainPtr<const CPDF_Dictionary> xobjects_after =
++      page->GetResources()->GetDictFor("XObject");
++  ASSERT_TRUE(xobjects_after);
++  EXPECT_EQ((std::vector<ByteString>{"FXX1", "FXX2", "FXX3", "FXX5"}),
++            xobjects_after->GetKeys());
++  const std::vector<ByteString> new_names = {"FXX1", "FXX3", "FXX5"};
++  for (size_t i = 0; i < new_names.size(); ++i) {
++    RetainPtr<const CPDF_Reference> ref =
++        ToReference(xobjects_after->GetObjectFor(new_names[i].AsStringView()));
++    ASSERT_TRUE(ref);
++    EXPECT_EQ(new_forms[i]->GetObjNum(), ref->GetRefObjNum());
++  }
++  EXPECT_TRUE(page->all_removed_resources_map()["XObject"].contains("FXX4"));
++  EXPECT_FALSE(xobjects_after->KeyExist("FXX4"));
++}

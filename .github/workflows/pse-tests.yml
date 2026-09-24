@@ -1,0 +1,99 @@
+name: PSE patch tests
+
+# Patched build for PDF Studio Elite: GenerateContent performance.
+# Builds PDFium's own unit and embedder tests on Linux, runs them without and
+# with patches/pse/0001-generatecontent-perf.patch, and fails if the patch
+# introduces a test failure (or if its new unit tests fail).
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: PDFium branch
+        required: false
+        default: chromium/8066
+
+permissions: {}
+
+jobs:
+  test:
+    name: Test patch
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      PDFium_BRANCH: ${{ inputs.branch }}
+      PDFium_TARGET_OS: linux
+      PDFium_TARGET_CPU: x64
+      PDFium_ENABLE_V8: false
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Set environment variables
+        run: steps/00-environment.sh
+        shell: bash
+      - name: Install (1/2)
+        run: steps/01-install.sh
+        shell: bash
+      - name: Checkout PDFium
+        run: steps/02-checkout.sh
+        shell: bash
+        timeout-minutes: 15
+      - name: Install (2/2)
+        run: steps/04-install-extras.sh
+        shell: bash
+      - name: Configure
+        shell: bash
+        run: |
+          mkdir -p pdfium/out
+          cat >pdfium/out/args.gn <<END
+          is_debug = false
+          dcheck_always_on = true
+          pdf_is_standalone = true
+          pdf_enable_v8 = false
+          pdf_enable_xfa = false
+          pdf_use_partition_alloc = false
+          clang_use_chrome_plugins = false
+          END
+          cd pdfium && gn gen out
+      - name: Build tests (unpatched)
+        run: ninja -C pdfium/out pdfium_unittests pdfium_embeddertests
+        shell: bash
+      - name: Run tests (unpatched)
+        run: bash steps/pse-run-tests.sh unpatched
+        shell: bash
+      - name: Apply patch
+        run: patch --verbose -p1 -d pdfium -i "$PWD/patches/pse/0001-generatecontent-perf.patch"
+        shell: bash
+      - name: Build tests (patched)
+        run: ninja -C pdfium/out pdfium_unittests pdfium_embeddertests
+        shell: bash
+      - name: Run tests (patched)
+        run: bash steps/pse-run-tests.sh patched
+        shell: bash
+      - name: Compare
+        shell: bash
+        run: |
+          echo "Failures without the patch:"; cat unpatched-failures.txt
+          echo "Failures with the patch:"; cat patched-failures.txt
+          comm -13 unpatched-failures.txt patched-failures.txt > new-failures.txt
+          {
+            echo "## PSE patch tests ($PDFium_BRANCH)"
+            echo "Failures without the patch: $(wc -l < unpatched-failures.txt)"
+            echo "Failures with the patch: $(wc -l < patched-failures.txt)"
+            echo "New failures: $(wc -l < new-failures.txt)"
+            echo '```'
+            cat new-failures.txt
+            grep -E '^\[( +OK|  FAILED  ) \] CPDFPageContentGeneratorTest' patched-generator.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep -q '^\[       OK \] CPDFPageContentGeneratorTest.KeepXObjectNames' patched-generator.log
+          [ ! -s new-failures.txt ]
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: pse-test-logs
+          path: "*.log"

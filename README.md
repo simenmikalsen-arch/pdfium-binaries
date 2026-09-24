@@ -2,6 +2,14 @@
   <img alt="PDFium binaries" src=".github/images/header.svg" />
 </p>
 
+> [!NOTE]
+> **Fork: patched build for PDF Studio Elite (GenerateContent performance).**
+> Branch `pse/generatecontent-perf` adds one PDFium patch,
+> [`patches/pse/0001-generatecontent-perf.patch`](patches/pse/README.md), which makes
+> `FPDFPage_GenerateContent()` linear instead of quadratic in the number of XObjects on a page.
+> Everything else is the unmodified [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries).
+> This fork publishes nothing to nuget.org. Please report problems with the patch here, not upstream.
+
 # Pre-compiled binaries of PDFium
 
 [![Patches](https://github.com/bblanchon/pdfium-binaries/actions/workflows/patch.yml/badge.svg?branch=master)](https://github.com/bblanchon/pdfium-binaries/actions/workflows/patch.yml)

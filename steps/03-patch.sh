@@ -28,6 +28,10 @@ esac
 apply_patch "$PATCHES/public_headers.patch"
 apply_patch "$PATCHES/clang_rt.patch" build
 
+# Patched build for PDF Studio Elite: GenerateContent performance.
+# See patches/pse/README.md.
+apply_patch "$PATCHES/pse/0001-generatecontent-perf.patch"
+
 [ "$ENABLE_V8" == "true" ] && apply_patch "$PATCHES/v8/pdfium.patch"
 
 case "$OS" in
