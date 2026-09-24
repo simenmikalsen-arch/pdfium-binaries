@@ -1,5 +1,5 @@
 diff --git a/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp b/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp
-index f5fdb62..b42bb6e 100644
+index f5fdb62..96d446a 100644
 --- a/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp
 +++ b/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp
 @@ -19,6 +19,7 @@
@@ -109,7 +109,7 @@ index f5fdb62..b42bb6e 100644
      obj_holder_->GraphicsMapInsert(graphD, name);
    }
    *buf << "/" << PDF_NameEncode(name) << " gs ";
-@@ -1005,14 +1024,26 @@ void CPDF_PageContentGenerator::ProcessText(fxcrt::ostringstream* buf,
+@@ -1005,14 +1024,27 @@ void CPDF_PageContentGenerator::ProcessText(fxcrt::ostringstream* buf,
      pEncoding = font->AsTrueTypeFont()->GetEncoding();
    } else if (font->IsCIDFont()) {
      data.type = "Type0";
@@ -123,22 +123,23 @@ index f5fdb62..b42bb6e 100644
    ByteString dict_name;
 -  std::optional<ByteString> maybe_name = obj_holder_->FontsMapSearch(data);
 -  if (maybe_name.has_value()) {
-+  RetainPtr<const CPDF_Dictionary> font_dict = font->GetFontDict();
++  RetainPtr<const CPDF_Dictionary> text_font_dict = font->GetFontDict();
 +  std::optional<ByteString> maybe_name;
 +  if (IsResourceNameMappedTo(obj_holder_->GetResources().Get(), "Font",
-+                             pTextObj->GetResourceName(), font_dict.Get())) {
++                             pTextObj->GetResourceName(),
++                             text_font_dict.Get())) {
 +    // Keep the name the text was parsed with while it still refers to this
 +    // very font dictionary (as ProcessImage() / ProcessForm() do).
 +    dict_name = pTextObj->GetResourceName();
 +  } else if (font->IsType3Font()) {
 +    // A Type3 font has no /BaseFont to key the fonts map with, and its glyph
 +    // procedures must be kept: write its own dictionary.
-+    dict_name = FindOrRealizeResource(font_dict, "Font");
++    dict_name = FindOrRealizeResource(text_font_dict, "Font");
 +  } else if ((maybe_name = obj_holder_->FontsMapSearch(data)).has_value()) {
      dict_name = std::move(maybe_name.value());
    } else {
      RetainPtr<const CPDF_Object> pIndirectFont = font->GetFontDict();
-@@ -1037,6 +1068,16 @@ void CPDF_PageContentGenerator::ProcessText(fxcrt::ostringstream* buf,
+@@ -1037,6 +1069,16 @@ void CPDF_PageContentGenerator::ProcessText(fxcrt::ostringstream* buf,
    *buf << "/" << PDF_NameEncode(dict_name) << " ";
    WriteFloat(*buf, pTextObj->GetFontSize()) << " Tf ";
    *buf << static_cast<int>(pTextObj->GetTextRenderMode()) << " Tr ";
@@ -155,7 +156,7 @@ index f5fdb62..b42bb6e 100644
  
    *buf << "[";
    ByteString text;
-@@ -1055,3 +1096,141 @@ void CPDF_PageContentGenerator::ProcessText(fxcrt::ostringstream* buf,
+@@ -1055,3 +1097,141 @@ void CPDF_PageContentGenerator::ProcessText(fxcrt::ostringstream* buf,
    *buf << "] TJ ET";
    EndProcessGraphics(*buf);
  }
