@@ -1,0 +1,441 @@
+diff --git a/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp b/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp
+index f5fdb62..b42bb6e 100644
+--- a/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp
++++ b/core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp
+@@ -19,6 +19,7 @@
+ #include "core/fpdfapi/edit/cpdf_stringarchivestream.h"
+ #include "core/fpdfapi/font/cpdf_truetypefont.h"
+ #include "core/fpdfapi/font/cpdf_type1font.h"
++#include "core/fpdfapi/page/cpdf_color.h"
+ #include "core/fpdfapi/page/cpdf_contentmarks.h"
+ #include "core/fpdfapi/page/cpdf_docpagedata.h"
+ #include "core/fpdfapi/page/cpdf_form.h"
+@@ -28,7 +29,11 @@
+ #include "core/fpdfapi/page/cpdf_page.h"
+ #include "core/fpdfapi/page/cpdf_path.h"
+ #include "core/fpdfapi/page/cpdf_pathobject.h"
++#include "core/fpdfapi/page/cpdf_pattern.h"
++#include "core/fpdfapi/page/cpdf_shadingobject.h"
++#include "core/fpdfapi/page/cpdf_shadingpattern.h"
+ #include "core/fpdfapi/page/cpdf_textobject.h"
++#include "core/fpdfapi/page/cpdf_tilingpattern.h"
+ #include "core/fpdfapi/parser/cpdf_array.h"
+ #include "core/fpdfapi/parser/cpdf_dictionary.h"
+ #include "core/fpdfapi/parser/cpdf_document.h"
+@@ -685,6 +690,8 @@ void CPDF_PageContentGenerator::ProcessPageObject(fxcrt::ostringstream* buf,
+     ProcessPath(buf, pPathObj);
+   } else if (CPDF_TextObject* pTextObj = pPageObj->AsText()) {
+     ProcessText(buf, pTextObj);
++  } else if (CPDF_ShadingObject* pShadingObj = pPageObj->AsShading()) {
++    ProcessShading(buf, pShadingObj);
+   }
+   pPageObj->SetDirty(false);
+ }
+@@ -696,11 +703,9 @@ void CPDF_PageContentGenerator::ProcessImage(fxcrt::ostringstream* buf,
+     return;
+   }
+ 
++  // An inline image is written as an image XObject (its stream is made
++  // indirect below) instead of being dropped.
+   RetainPtr<CPDF_Image> pImage = pImageObj->GetImage();
+-  if (pImage->IsInline()) {
+-    return;
+-  }
+-
+   RetainPtr<const CPDF_Stream> pStream = pImage->GetStream();
+   if (!pStream) {
+     return;
+@@ -856,24 +861,29 @@ void CPDF_PageContentGenerator::ProcessPath(fxcrt::ostringstream* buf,
+ void CPDF_PageContentGenerator::ProcessGraphics(fxcrt::ostringstream* buf,
+                                                 CPDF_PageObject* pPageObj) {
+   *buf << "q ";
+-  if (WriteColorToStream(*buf, pPageObj->color_state().GetFillColor())) {
+-    *buf << " rg ";
+-  }
+-  if (WriteColorToStream(*buf, pPageObj->color_state().GetStrokeColor())) {
+-    *buf << " RG ";
+-  }
++  // The ExtGState resources the object was parsed with come first, so that
++  // everything written below overrides the parameters they also set.
++  const bool wrote_original_states =
++      ProcessOriginalGraphicsStates(*buf, pPageObj);
++  WriteColor(*buf, pPageObj->color_state().GetFillColor(), /*stroke=*/false);
++  WriteColor(*buf, pPageObj->color_state().GetStrokeColor(), /*stroke=*/true);
+   float line_width = pPageObj->graph_state().GetLineWidth();
+-  if (line_width != 1.0f) {
++  if (line_width != 1.0f || wrote_original_states) {
+     WriteFloat(*buf, line_width) << " w ";
+   }
+   CFX_GraphStateData::LineCap lineCap = pPageObj->graph_state().GetLineCap();
+-  if (lineCap != CFX_GraphStateData::LineCap::kButt) {
++  if (lineCap != CFX_GraphStateData::LineCap::kButt || wrote_original_states) {
+     *buf << static_cast<int>(lineCap) << " J ";
+   }
+   CFX_GraphStateData::LineJoin lineJoin = pPageObj->graph_state().GetLineJoin();
+-  if (lineJoin != CFX_GraphStateData::LineJoin::kMiter) {
++  if (lineJoin != CFX_GraphStateData::LineJoin::kMiter ||
++      wrote_original_states) {
+     *buf << static_cast<int>(lineJoin) << " j ";
+   }
++  const float miter_limit = pPageObj->graph_state().GetMiterLimit();
++  if (miter_limit != 10.0f || wrote_original_states) {
++    WriteFloat(*buf, miter_limit) << " M ";
++  }
+   std::vector<float> dash_array = pPageObj->graph_state().GetLineDashArray();
+   if (dash_array.size()) {
+     *buf << "[";
+@@ -885,6 +895,8 @@ void CPDF_PageContentGenerator::ProcessGraphics(fxcrt::ostringstream* buf,
+     }
+     *buf << "] ";
+     WriteFloat(*buf, pPageObj->graph_state().GetLineDashPhase()) << " d ";
++  } else if (wrote_original_states) {
++    *buf << "[] 0 d ";
+   }
+ 
+   const CPDF_ClipPath& clip_path = pPageObj->clip_path();
+@@ -938,7 +950,14 @@ void CPDF_PageContentGenerator::ProcessGraphics(fxcrt::ostringstream* buf,
+     }
+     document_->AddIndirectObject(gsDict);
+     name = RealizeResource(std::move(gsDict), "ExtGState");
+-    pPageObj->mutable_general_state().SetGraphicsResourceNames({name});
++    // Keep the names the object was parsed with: they are written again by
++    // ProcessOriginalGraphicsStates() on the next regeneration.
++    pdfium::span<const ByteString> old_names =
++        pPageObj->GetGraphicsResourceNames();
++    std::vector<ByteString> names(old_names.begin(), old_names.end());
++    names.push_back(name);
++    pPageObj->mutable_general_state().SetGraphicsResourceNames(
++        std::move(names));
+     obj_holder_->GraphicsMapInsert(graphD, name);
+   }
+   *buf << "/" << PDF_NameEncode(name) << " gs ";
+@@ -1005,14 +1024,26 @@ void CPDF_PageContentGenerator::ProcessText(fxcrt::ostringstream* buf,
+     pEncoding = font->AsTrueTypeFont()->GetEncoding();
+   } else if (font->IsCIDFont()) {
+     data.type = "Type0";
++  } else if (font->IsType3Font()) {
++    data.type = "Type3";
+   } else {
+     return;
+   }
+   data.baseFont = font->GetBaseFontName();
+ 
+   ByteString dict_name;
+-  std::optional<ByteString> maybe_name = obj_holder_->FontsMapSearch(data);
+-  if (maybe_name.has_value()) {
++  RetainPtr<const CPDF_Dictionary> font_dict = font->GetFontDict();
++  std::optional<ByteString> maybe_name;
++  if (IsResourceNameMappedTo(obj_holder_->GetResources().Get(), "Font",
++                             pTextObj->GetResourceName(), font_dict.Get())) {
++    // Keep the name the text was parsed with while it still refers to this
++    // very font dictionary (as ProcessImage() / ProcessForm() do).
++    dict_name = pTextObj->GetResourceName();
++  } else if (font->IsType3Font()) {
++    // A Type3 font has no /BaseFont to key the fonts map with, and its glyph
++    // procedures must be kept: write its own dictionary.
++    dict_name = FindOrRealizeResource(font_dict, "Font");
++  } else if ((maybe_name = obj_holder_->FontsMapSearch(data)).has_value()) {
+     dict_name = std::move(maybe_name.value());
+   } else {
+     RetainPtr<const CPDF_Object> pIndirectFont = font->GetFontDict();
+@@ -1037,6 +1068,16 @@ void CPDF_PageContentGenerator::ProcessText(fxcrt::ostringstream* buf,
+   *buf << "/" << PDF_NameEncode(dict_name) << " ";
+   WriteFloat(*buf, pTextObj->GetFontSize()) << " Tf ";
+   *buf << static_cast<int>(pTextObj->GetTextRenderMode()) << " Tr ";
++  // Character and word spacing are part of the positions PDFium computed
++  // for the glyphs; without them the text would shrink when written back.
++  const float char_space = pTextObj->text_state().GetCharSpace();
++  if (char_space != 0) {
++    WriteFloat(*buf, char_space) << " Tc ";
++  }
++  const float word_space = pTextObj->text_state().GetWordSpace();
++  if (word_space != 0) {
++    WriteFloat(*buf, word_space) << " Tw ";
++  }
+ 
+   *buf << "[";
+   ByteString text;
+@@ -1055,3 +1096,141 @@ void CPDF_PageContentGenerator::ProcessText(fxcrt::ostringstream* buf,
+   *buf << "] TJ ET";
+   EndProcessGraphics(*buf);
+ }
++
++void CPDF_PageContentGenerator::ProcessShading(
++    fxcrt::ostringstream* buf,
++    CPDF_ShadingObject* pShadingObj) {
++  const CPDF_ShadingPattern* pattern = pShadingObj->pattern();
++  if (!pattern) {
++    return;
++  }
++
++  ByteString name =
++      FindOrRealizeResource(pattern->GetShadingObject(), "Shading");
++  if (name.IsEmpty()) {
++    return;
++  }
++
++  // The clip path written by ProcessGraphics() bounds the painted area.
++  ProcessGraphics(buf, pShadingObj);
++  const CFX_Matrix& matrix = pShadingObj->matrix();
++  if (!matrix.IsIdentity()) {
++    WriteMatrix(*buf, matrix) << " cm ";
++  }
++  *buf << "/" << PDF_NameEncode(name) << " sh";
++  EndProcessGraphics(*buf);
++}
++
++bool CPDF_PageContentGenerator::WriteColor(fxcrt::ostringstream& buf,
++                                           const CPDF_Color* color,
++                                           bool stroke) {
++  if (!color || color->IsNull()) {
++    return false;
++  }
++
++  if (color->IsPattern()) {
++    RetainPtr<CPDF_Pattern> pattern = color->GetPattern();
++    if (!pattern) {
++      return false;
++    }
++    // An uncolored tiling pattern also needs its underlying color space and
++    // components, which are not kept.
++    CPDF_TilingPattern* tiling = pattern->AsTilingPattern();
++    if (tiling && !tiling->colored()) {
++      return false;
++    }
++    ByteString name =
++        FindOrRealizeResource(pattern->GetPatternObject(), "Pattern");
++    if (name.IsEmpty()) {
++      return false;
++    }
++    buf << (stroke ? "/Pattern CS /" : "/Pattern cs /")
++        << PDF_NameEncode(name) << (stroke ? " SCN " : " scn ");
++    return true;
++  }
++
++  if (color->IsColorSpaceCMYK()) {
++    std::vector<float> values = color->GetNonPatternValues();
++    if (values.size() < 4) {
++      return false;
++    }
++    for (size_t i = 0; i < 4; ++i) {
++      WriteFloat(buf, values[i]) << " ";
++    }
++    buf << (stroke ? "K " : "k ");
++    return true;
++  }
++
++  if (!WriteColorToStream(buf, color)) {
++    return false;
++  }
++  buf << (stroke ? " RG " : " rg ");
++  return true;
++}
++
++bool CPDF_PageContentGenerator::ProcessOriginalGraphicsStates(
++    fxcrt::ostringstream& buf,
++    CPDF_PageObject* pPageObj) {
++  pdfium::span<const ByteString> names = pPageObj->GetGraphicsResourceNames();
++  if (names.empty()) {
++    return false;
++  }
++
++  RetainPtr<const CPDF_Dictionary> resources = obj_holder_->GetResources();
++  RetainPtr<const CPDF_Dictionary> states =
++      resources ? resources->GetDictFor("ExtGState") : nullptr;
++  if (!states) {
++    return false;
++  }
++
++  // A soft mask is positioned by the CTM in effect when its ExtGState was
++  // set; the regenerated stream starts from the identity matrix.
++  const CFX_Matrix* smask_matrix = pPageObj->general_state().GetSMaskMatrix();
++  const bool move_smask = pPageObj->general_state().GetSoftMask() &&
++                          smask_matrix && !smask_matrix->IsIdentity();
++  bool wrote = false;
++  for (const ByteString& name : names) {
++    if (!states->GetDictFor(name.AsStringView())) {
++      continue;
++    }
++    if (!wrote && move_smask) {
++      WriteMatrix(buf, *smask_matrix) << " cm ";
++    }
++    buf << "/" << PDF_NameEncode(name) << " gs ";
++    wrote = true;
++  }
++  if (wrote && move_smask) {
++    WriteMatrix(buf, smask_matrix->GetInverse()) << " cm ";
++  }
++  return wrote;
++}
++
++ByteString CPDF_PageContentGenerator::FindOrRealizeResource(
++    RetainPtr<const CPDF_Object> resource,
++    ByteStringView type) {
++  if (!resource) {
++    return ByteString();
++  }
++
++  if (resource->IsInline()) {
++    // A direct object in the resources: give a copy an object number.
++    RetainPtr<CPDF_Object> clone = resource->Clone();
++    document_->AddIndirectObject(clone);
++    resource = clone;
++  }
++
++  const uint32_t obj_num = resource->GetObjNum();
++  RetainPtr<const CPDF_Dictionary> resources = obj_holder_->GetResources();
++  RetainPtr<const CPDF_Dictionary> dict =
++      resources ? resources->GetDictFor(type) : nullptr;
++  if (dict) {
++    CPDF_DictionaryLocker locker(dict);
++    for (const auto& it : locker) {
++      RetainPtr<const CPDF_Reference> ref = ToReference(it.second);
++      if (ref && ref->GetRefObjNum() == obj_num) {
++        return it.first;
++      }
++    }
++  }
++  return RealizeResource(resource.Get(), type);
++}
+diff --git a/core/fpdfapi/edit/cpdf_pagecontentgenerator.h b/core/fpdfapi/edit/cpdf_pagecontentgenerator.h
+index ae09fd5..e5c65ed 100644
+--- a/core/fpdfapi/edit/cpdf_pagecontentgenerator.h
++++ b/core/fpdfapi/edit/cpdf_pagecontentgenerator.h
+@@ -14,9 +14,12 @@
+ 
+ #include "core/fxcrt/bytestring.h"
+ #include "core/fxcrt/fx_string_wrappers.h"
++#include "core/fxcrt/retain_ptr.h"
+ #include "core/fxcrt/unowned_ptr.h"
+ 
++class CPDF_Color;
+ class CPDF_ContentMarks;
++class CPDF_ShadingObject;
+ class CPDF_Document;
+ class CPDF_FormObject;
+ class CPDF_ImageObject;
+@@ -46,9 +49,24 @@ class CPDF_PageContentGenerator {
+   void ProcessGraphics(fxcrt::ostringstream* buf, CPDF_PageObject* pPageObj);
+   void ProcessDefaultGraphics(fxcrt::ostringstream* buf);
+   void ProcessText(fxcrt::ostringstream* buf, CPDF_TextObject* pTextObj);
++  void ProcessShading(fxcrt::ostringstream* buf,
++                      CPDF_ShadingObject* pShadingObj);
++  // Writes the color operator for `color` (RGB, gray, CMYK or a colored
++  // pattern). Returns whether it wrote anything.
++  bool WriteColor(fxcrt::ostringstream& buf,
++                  const CPDF_Color* color,
++                  bool stroke);
++  // Re-emits the ExtGState resources the object was parsed with (soft masks,
++  // overprint, ...). Returns whether it wrote any.
++  bool ProcessOriginalGraphicsStates(fxcrt::ostringstream& buf,
++                                     CPDF_PageObject* pPageObj);
+   ByteString GetOrCreateDefaultGraphics();
+   ByteString RealizeResource(const CPDF_Object* pResource,
+                              ByteStringView type);
++  // Returns the name `resource` already has in the resource dictionary of
++  // `type`, or realizes a new one. A direct `resource` is made indirect first.
++  ByteString FindOrRealizeResource(RetainPtr<const CPDF_Object> resource,
++                                   ByteStringView type);
+   const CPDF_ContentMarks* ProcessContentMarks(fxcrt::ostringstream* buf,
+                                                const CPDF_PageObject* pPageObj,
+                                                const CPDF_ContentMarks* pPrev);
+diff --git a/core/fpdfapi/edit/cpdf_pagecontentgenerator_unittest.cpp b/core/fpdfapi/edit/cpdf_pagecontentgenerator_unittest.cpp
+index 77a6546..9ca7f67 100644
+--- a/core/fpdfapi/edit/cpdf_pagecontentgenerator_unittest.cpp
++++ b/core/fpdfapi/edit/cpdf_pagecontentgenerator_unittest.cpp
+@@ -656,3 +656,42 @@ TEST_F(CPDFPageContentGeneratorTest, NewXObjectNamesSkipTakenNames) {
+   EXPECT_TRUE(page->all_removed_resources_map()["XObject"].contains("FXX4"));
+   EXPECT_FALSE(xobjects_after->KeyExist("FXX4"));
+ }
++
++TEST_F(CPDFPageContentGeneratorTest, ProcessCMYKPathWithMiterLimit) {
++  auto path_obj = std::make_unique<CPDF_PathObject>();
++  path_obj->set_filltype(CFX_FillRenderOptions::FillType::kWinding);
++  path_obj->path().AppendRect(0, 0, 10, 10);
++  RetainPtr<CPDF_ColorSpace> cmyk =
++      CPDF_ColorSpace::GetStockCS(CPDF_ColorSpace::Family::kDeviceCMYK);
++  path_obj->mutable_color_state().SetFillColor(
++      cmyk, std::vector<float>{0.1f, 0.9f, 0.8f, 0});
++  path_obj->mutable_color_state().SetStrokeColor(
++      cmyk, std::vector<float>{0, 0, 0, 1});
++  path_obj->mutable_graph_state().SetMiterLimit(2);
++
++  auto dummy_page_dict = pdfium::MakeRetain<CPDF_Dictionary>();
++  auto test_page = pdfium::MakeRetain<CPDF_Page>(nullptr, dummy_page_dict);
++  CPDF_PageContentGenerator generator(test_page.Get());
++  fxcrt::ostringstream buf;
++  TestProcessPath(&generator, &buf, path_obj.get());
++  EXPECT_EQ("q .1 .9 .8 0 k 0 0 0 1 K 2 M 0 0 10 10 re f Q\n",
++            ByteString(buf));
++}
++
++TEST_F(CPDFPageContentGeneratorTest, ProcessTextWithCharAndWordSpacing) {
++  auto doc = std::make_unique<CPDF_TestDocument>();
++  doc->CreateNewDoc();
++  RetainPtr<CPDF_Dictionary> page_dict(doc->CreateNewPage(0));
++  auto page = pdfium::MakeRetain<CPDF_Page>(doc.get(), page_dict);
++  CPDF_PageContentGenerator generator(page.Get());
++  auto text_obj = std::make_unique<CPDF_TextObject>();
++  text_obj->mutable_text_state().SetFont(
++      CPDF_Font::GetStockFont(doc.get(), "Helvetica"));
++  text_obj->mutable_text_state().SetFontSize(12.0f);
++  text_obj->mutable_text_state().SetCharSpace(2.5f);
++  text_obj->mutable_text_state().SetWordSpace(6.0f);
++  text_obj->SetText("A B");
++  fxcrt::ostringstream buf;
++  TestProcessText(&generator, &buf, text_obj.get());
++  EXPECT_TRUE(ByteString(buf).Contains(" 12 Tf 0 Tr 2.5 Tc 6 Tw [<412042>] TJ ET"));
++}
+diff --git a/core/fpdfapi/page/cpdf_color.cpp b/core/fpdfapi/page/cpdf_color.cpp
+index 7709dfc..b17196d 100644
+--- a/core/fpdfapi/page/cpdf_color.cpp
++++ b/core/fpdfapi/page/cpdf_color.cpp
+@@ -100,6 +100,19 @@ bool CPDF_Color::IsColorSpaceGray() const {
+          CPDF_ColorSpace::GetStockCS(CPDF_ColorSpace::Family::kDeviceGray);
+ }
+ 
++bool CPDF_Color::IsColorSpaceCMYK() const {
++  return cs_ ==
++         CPDF_ColorSpace::GetStockCS(CPDF_ColorSpace::Family::kDeviceCMYK);
++}
++
++std::vector<float> CPDF_Color::GetNonPatternValues() const {
++  if (!cs_ || IsPatternInternal() ||
++      !std::holds_alternative<std::vector<float>>(color_data_)) {
++    return {};
++  }
++  return std::get<std::vector<float>>(color_data_);
++}
++
+ std::optional<FX_COLORREF> CPDF_Color::GetColorRef() const {
+   std::optional<FX_RGB_STRUCT<float>> maybe_rgb = GetRGB();
+   if (!maybe_rgb.has_value()) {
+diff --git a/core/fpdfapi/page/cpdf_color.h b/core/fpdfapi/page/cpdf_color.h
+index 69f0226..f0bb53d 100644
+--- a/core/fpdfapi/page/cpdf_color.h
++++ b/core/fpdfapi/page/cpdf_color.h
+@@ -41,6 +41,10 @@ class CPDF_Color {
+   uint32_t ComponentCount() const;
+   bool IsColorSpaceRGB() const;
+   bool IsColorSpaceGray() const;
++  bool IsColorSpaceCMYK() const;
++
++  // The components of a non-pattern color. Empty for a null or pattern color.
++  std::vector<float> GetNonPatternValues() const;
+   // Wrapper around GetRGB() that returns the RGB value as FX_COLORREF. The
+   // GetRGB() return value is clamped to fit into FX_COLORREF, where the color
+   // components are 8-bit fields within an unsigned integer.
+diff --git a/core/fpdfapi/page/cpdf_pattern.h b/core/fpdfapi/page/cpdf_pattern.h
+index 5aaf703..49fb67c 100644
+--- a/core/fpdfapi/page/cpdf_pattern.h
++++ b/core/fpdfapi/page/cpdf_pattern.h
+@@ -27,6 +27,9 @@ class CPDF_Pattern : public Retainable, public Observable {
+ 
+   const CFX_Matrix& pattern_to_form() const { return pattern_to_form_; }
+ 
++  // The pattern dictionary or stream, for writing it back as a resource.
++  RetainPtr<const CPDF_Object> GetPatternObject() const { return pattern_obj_; }
++
+  protected:
+   CPDF_Pattern(CPDF_Document* doc,
+                RetainPtr<CPDF_Object> pObj,

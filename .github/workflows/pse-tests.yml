@@ -66,7 +66,9 @@ jobs:
         run: bash steps/pse-run-tests.sh unpatched
         shell: bash
       - name: Apply patch
-        run: patch --verbose -p1 -d pdfium -i "$PWD/patches/pse/0001-generatecontent-perf.patch"
+        run: |
+          patch --verbose -p1 -d pdfium -i "$PWD/patches/pse/0001-generatecontent-perf.patch"
+          patch --verbose -p1 -d pdfium -i "$PWD/patches/pse/0002-generatecontent-fidelity-spike.patch"
         shell: bash
       - name: Build tests (patched)
         run: ninja -C pdfium/out/Release pdfium_unittests pdfium_embeddertests
@@ -91,6 +93,8 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           grep -q '^\[       OK \] CPDFPageContentGeneratorTest.KeepXObjectNames' patched-generator.log
+          grep -q '^\[       OK \] CPDFPageContentGeneratorTest.ProcessCMYKPathWithMiterLimit' patched-generator.log
+          grep -q '^\[       OK \] CPDFPageContentGeneratorTest.ProcessTextWithCharAndWordSpacing' patched-generator.log
           [ ! -s new-failures.txt ]
       - name: Upload logs
         if: always()

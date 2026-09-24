@@ -31,6 +31,8 @@ apply_patch "$PATCHES/clang_rt.patch" build
 # Patched build for PDF Studio Elite: GenerateContent performance.
 # See patches/pse/README.md.
 apply_patch "$PATCHES/pse/0001-generatecontent-perf.patch"
+# Editing fidelity SPIKE (module 19 feasibility, not for release): see patches/pse/README.md.
+apply_patch "$PATCHES/pse/0002-generatecontent-fidelity-spike.patch"
 
 [ "$ENABLE_V8" == "true" ] && apply_patch "$PATCHES/v8/pdfium.patch"
 

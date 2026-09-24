@@ -23,3 +23,12 @@ before and after applying the patch and fails on new test failures.
 Build for a new PDFium release: rebase this branch onto the new bblanchon tag
 (`chromium/NNNN`), then run the "Build one" workflow with `branch=chromium/NNNN`,
 `version=<major>.0.NNNN.0`, `target_os=win`, `target_cpu=x64`.
+
+## 0002 - editing fidelity SPIKE (branch pse/editing-fidelity-spike only, not for release)
+
+`0002-generatecontent-fidelity-spike.patch` (on top of 0001) is the prototype of option 2 of the PDF Studio Elite
+module 19 feasibility spike (docs/EDITING-FIDELITY-SPIKE.md in that repository): it makes
+`FPDFPage_GenerateContent()` keep more of what it regenerates - `Tc`/`Tw`, Type3 fonts (and a text object's
+existing font resource name), DeviceCMYK colours, coloured patterns, shading objects (`sh`), inline images (written as
+image XObjects), the miter limit, and the ExtGState resources an object was parsed with (soft masks, overprint). Two new
+unit tests. The DLL says `-pse2spike` in its ProductVersion.
