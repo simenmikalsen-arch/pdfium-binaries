@@ -28,9 +28,12 @@ esac
 apply_patch "$PATCHES/public_headers.patch"
 apply_patch "$PATCHES/clang_rt.patch" build
 
-# Patched build for PDF Studio Elite: GenerateContent performance.
-# See patches/pse/README.md.
+# Patched build for PDF Studio Elite (see patches/pse/README.md):
+# GenerateContent performance, lazy popup appearances, full save writes only
+# reachable objects.
 apply_patch "$PATCHES/pse/0001-generatecontent-perf.patch"
+apply_patch "$PATCHES/pse/0002-popup-lazy-appearance.patch"
+apply_patch "$PATCHES/pse/0003-save-reachable-objects.patch"
 
 [ "$ENABLE_V8" == "true" ] && apply_patch "$PATCHES/v8/pdfium.patch"
 

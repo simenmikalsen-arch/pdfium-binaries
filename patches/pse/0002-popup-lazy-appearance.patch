@@ -1,0 +1,110 @@
+diff --git a/core/fpdfdoc/cpdf_annot.cpp b/core/fpdfdoc/cpdf_annot.cpp
+index 9178264..13a9680 100644
+--- a/core/fpdfdoc/cpdf_annot.cpp
++++ b/core/fpdfdoc/cpdf_annot.cpp
+@@ -134,7 +134,16 @@ CPDF_Annot::CPDF_Annot(RetainPtr<CPDF_Dictionary> dict, CPDF_Document* document)
+       is_text_markup_annotation_(IsTextMarkupAnnotation(subtype_)),
+       has_generated_ap_(
+           annot_dict_->GetBooleanFor(kPDFiumKey_HasGeneratedAP, false)) {
+-  GenerateAPIfNeeded();
++  // A Popup annotation is only ever the one CPDF_AnnotList creates for a
++  // markup annotation with /Contents (popups from the file are skipped). It is
++  // drawn only while it is open (ShouldDrawAnnotation()), and DrawAppearance()
++  // / DrawInContext() generate its appearance on demand. Generating it here
++  // added a new appearance stream and a new font dictionary to the document
++  // for every such markup on every CPDF_AnnotList construction (every render
++  // call with FPDF_ANNOT), and a full save wrote all of them.
++  if (subtype_ != Subtype::POPUP) {
++    GenerateAPIfNeeded();
++  }
+ }
+ 
+ CPDF_Annot::~CPDF_Annot() {
+diff --git a/core/fpdfdoc/cpdf_annotlist_unittest.cpp b/core/fpdfdoc/cpdf_annotlist_unittest.cpp
+index a59f959..c64bb05 100644
+--- a/core/fpdfdoc/cpdf_annotlist_unittest.cpp
++++ b/core/fpdfdoc/cpdf_annotlist_unittest.cpp
+@@ -115,6 +115,27 @@ TEST_F(CPDFAnnotListTest, CreatePopupAnnotFromEmptyUnicode) {
+   EXPECT_EQ(1u, list.Count());
+ }
+ 
++TEST_F(CPDFAnnotListTest, CreatePopupAnnotAddsNoObjectsToDocument) {
++  AddTextAnnotation("Hello");
++
++  {
++    // The first list makes the annotation indirect and generates its own
++    // appearance - both are kept in the document.
++    CPDF_AnnotList list(page_);
++    ASSERT_EQ(2u, list.Count());
++  }
++  const uint32_t last_obj_num = document_->GetLastObjNum();
++  for (int i = 0; i < 3; ++i) {
++    CPDF_AnnotList list(page_);
++    ASSERT_EQ(2u, list.Count());
++    const CPDF_Annot* popup = list.GetAt(1);
++    EXPECT_EQ(CPDF_Annot::Subtype::POPUP, popup->GetSubtype());
++    // The popup is closed, so it has no appearance yet.
++    EXPECT_FALSE(popup->GetAnnotDict()->KeyExist(pdfium::annotation::kAP));
++  }
++  EXPECT_EQ(last_obj_num, document_->GetLastObjNum());
++}
++
+ TEST_F(CPDFAnnotListTest, CreatePopupAnnotFromEmptyUnicodedWithEscape) {
+   const ByteString kContents =
+       MakeByteString({0xFE, 0xFF, 0x00, 0x1B, 'j', 'a', 0x00, 0x1B});
+diff --git a/fpdfsdk/fpdf_annot_embeddertest.cpp b/fpdfsdk/fpdf_annot_embeddertest.cpp
+index 470b1f1..059285d 100644
+--- a/fpdfsdk/fpdf_annot_embeddertest.cpp
++++ b/fpdfsdk/fpdf_annot_embeddertest.cpp
+@@ -445,6 +445,28 @@ TEST_F(FPDFAnnotEmbedderTest, RenderAnnotWithOnlyRolloverAP) {
+   CompareBitmap(bitmap.get(), "fpdf_annot_render_annot_with_only_rollover_ap");
+ }
+ 
++TEST_F(FPDFAnnotEmbedderTest, RenderAddsNoPopupObjectsToDocument) {
++  // One highlight annotation with (long) /Contents: every render call with
++  // FPDF_ANNOT builds a CPDF_AnnotList, which creates a popup for it.
++  ASSERT_TRUE(OpenDocument("annotation_highlight_long_content.pdf"));
++  ScopedPage page = LoadScopedPage(0);
++  ASSERT_TRUE(page);
++  // The first render may legitimately add the markup's own appearance.
++  RenderLoadedPageWithFlags(page.get(), FPDF_ANNOT);
++  // An incremental save writes every object the document holds that is new
++  // or loaded, so its size shows whether later renders create objects.
++  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, FPDF_INCREMENTAL));
++  const size_t size = GetString().size();
++  ClearString();
++
++  for (int i = 0; i < 5; ++i) {
++    RenderLoadedPageWithFlags(page.get(), FPDF_ANNOT);
++  }
++
++  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, FPDF_INCREMENTAL));
++  EXPECT_EQ(size, GetString().size());
++}
++
+ TEST_F(FPDFAnnotEmbedderTest, RenderMultilineMarkupAnnotWithoutAP) {
+   // Open a file with multiline markup annotations.
+   ASSERT_TRUE(OpenDocument("annotation_markup_multiline_no_ap.pdf"));
+@@ -2007,7 +2029,9 @@ TEST_F(FPDFAnnotEmbedderTest, GetFormAnnotAndCheckFlagsComboBox) {
+ }
+ 
+ TEST_F(FPDFAnnotEmbedderTest, Bug1206) {
+-  static constexpr size_t kExpectedMinimumOriginalSize = 1601;
++  // Without the objects of the popup appearance the form-fill environment's
++  // page view used to generate when the page was loaded.
++  static constexpr size_t kExpectedMinimumOriginalSize = 1000;
+ 
+   ASSERT_TRUE(OpenDocument("bug_1206.pdf"));
+ 
+@@ -2024,9 +2048,8 @@ TEST_F(FPDFAnnotEmbedderTest, Bug1206) {
+     CompareBitmapWithExpectationSuffix(bitmap.get(), "bug_1206");
+ 
+     ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
+-    // TODO(https://crbug.com/42270200): This is wrong. The size should be
+-    // equal, not bigger.
+-    EXPECT_GT(GetString().size(), original_size);
++    // https://crbug.com/42270200: rendering must not grow the saved document.
++    EXPECT_EQ(GetString().size(), original_size);
+     ClearString();
+   }
+ }

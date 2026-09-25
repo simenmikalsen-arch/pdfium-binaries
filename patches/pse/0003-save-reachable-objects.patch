@@ -1,0 +1,369 @@
+diff --git a/core/fpdfapi/edit/cpdf_creator.cpp b/core/fpdfapi/edit/cpdf_creator.cpp
+index 31e004f..c4daf66 100644
+--- a/core/fpdfapi/edit/cpdf_creator.cpp
++++ b/core/fpdfapi/edit/cpdf_creator.cpp
+@@ -13,6 +13,7 @@
+ #include <map>
+ #include <set>
+ #include <utility>
++#include <vector>
+ 
+ #include "core/fpdfapi/edit/cpdf_fontsubsetter.h"
+ #include "core/fpdfapi/parser/cpdf_array.h"
+@@ -23,7 +24,9 @@
+ #include "core/fpdfapi/parser/cpdf_flateencoder.h"
+ #include "core/fpdfapi/parser/cpdf_number.h"
+ #include "core/fpdfapi/parser/cpdf_parser.h"
++#include "core/fpdfapi/parser/cpdf_reference.h"
+ #include "core/fpdfapi/parser/cpdf_security_handler.h"
++#include "core/fpdfapi/parser/cpdf_stream.h"
+ #include "core/fpdfapi/parser/cpdf_string.h"
+ #include "core/fpdfapi/parser/fpdf_parser_utility.h"
+ #include "core/fpdfapi/parser/object_tree_traversal_util.h"
+@@ -119,6 +122,61 @@ bool OutputIndex(IFX_ArchiveStream* archive, FX_FILESIZE offset) {
+          archive->WriteByte(0);
+ }
+ 
++// Adds `object` (if it is indirect) and every indirect object reachable from it
++// to `objects`. Objects already in `objects` are not traversed again.
++void AddReachableObjects(const CPDF_Document* document,
++                         RetainPtr<const CPDF_Object> object,
++                         std::set<uint32_t>* objects) {
++  std::vector<RetainPtr<const CPDF_Object>> pending;
++  const uint32_t object_number = object->GetObjNum();
++  if (object_number != 0 && !objects->insert(object_number).second) {
++    return;
++  }
++  pending.push_back(std::move(object));
++  while (!pending.empty()) {
++    RetainPtr<const CPDF_Object> current = std::move(pending.back());
++    pending.pop_back();
++    switch (current->GetType()) {
++      case CPDF_Object::kArray: {
++        CPDF_ArrayLocker locker(current->AsArray());
++        for (const auto& it : locker) {
++          pending.push_back(it);
++        }
++        break;
++      }
++      case CPDF_Object::kDictionary: {
++        CPDF_DictionaryLocker locker(current->AsDictionary());
++        for (const auto& it : locker) {
++          pending.push_back(it.second);
++        }
++        break;
++      }
++      case CPDF_Object::kStream: {
++        CPDF_DictionaryLocker locker(current->AsStream()->GetDict());
++        for (const auto& it : locker) {
++          pending.push_back(it.second);
++        }
++        break;
++      }
++      case CPDF_Object::kReference: {
++        const uint32_t ref_object_number =
++            current->AsReference()->GetRefObjNum();
++        if (!objects->insert(ref_object_number).second) {
++          break;
++        }
++        RetainPtr<const CPDF_Object> target =
++            document->GetIndirectObject(ref_object_number);
++        if (target) {
++          pending.push_back(std::move(target));
++        }
++        break;
++      }
++      default:
++        break;
++    }
++  }
++}
++
+ }  // namespace
+ 
+ CPDF_Creator::CPDF_Creator(CPDF_Document* doc,
+@@ -180,11 +238,10 @@ bool CPDF_Creator::WriteOldObjs() {
+     return true;
+   }
+ 
+-  const std::set<uint32_t> objects_with_refs =
+-      GetObjectsWithReferences(document_);
++  // `objects_with_refs_` was filled by InitNewObjNumOffsets().
+   uint32_t last_object_number_written = 0;
+   for (uint32_t objnum = cur_obj_num_; objnum <= nLastObjNum; ++objnum) {
+-    if (!pdfium::Contains(objects_with_refs, objnum)) {
++    if (!pdfium::Contains(objects_with_refs_, objnum)) {
+       continue;
+     }
+     if (!WriteOldIndirectObject(objnum)) {
+@@ -226,6 +283,26 @@ bool CPDF_Creator::WriteNewObjs() {
+ }
+ 
+ void CPDF_Creator::InitNewObjNumOffsets() {
++  // A full save writes only the objects that are reachable from the trailer:
++  // the parsed ones (WriteOldObjs()) and, the same way, the ones created since
++  // the document was loaded or created. An unreferenced new object (e.g. an
++  // appearance stream that was replaced, or one generated for an annotation
++  // that no longer exists) is not written. This applies to documents without
++  // a parser (FPDF_CreateNewDocument(), e.g. with imported pages) too.
++  // `is_incremental_` is final here: WriteDoc_Stage1() has already cleared it
++  // for a document without a parser.
++  const bool write_only_referenced = !is_incremental_;
++  if (write_only_referenced) {
++    objects_with_refs_ = GetObjectsWithReferences(document_);
++    if (!parser_) {
++      // Without a parser the traversal starts at /Root, but the trailer that
++      // WriteDoc_Stage4() writes refers to /Info as well.
++      RetainPtr<const CPDF_Dictionary> info = document_->GetInfo();
++      if (info) {
++        AddReachableObjects(document_, std::move(info), &objects_with_refs_);
++      }
++    }
++  }
+   for (const auto& pair : *document_) {
+     const uint32_t objnum = pair.first;
+     if (pair.second->GetObjNum() == CPDF_Object::kInvalidObjNum) {
+@@ -236,6 +313,10 @@ void CPDF_Creator::InitNewObjNumOffsets() {
+         !parser_->IsObjectFree(objnum)) {
+       continue;
+     }
++    if (write_only_referenced &&
++        !pdfium::Contains(objects_with_refs_, objnum)) {
++      continue;
++    }
+     new_obj_num_array_.insert(
+         std::ranges::lower_bound(new_obj_num_array_, objnum), objnum);
+   }
+@@ -508,7 +589,11 @@ CPDF_Creator::Stage CPDF_Creator::WriteDoc_Stage4() {
+ 
+     uint32_t dwObjNum = encrypt_dict_->GetObjNum();
+     if (dwObjNum == 0) {
+-      dwObjNum = document_->GetLastObjNum() + 1;
++      // WriteDoc_Stage2() wrote the direct encryption dictionary as object
++      // `last_obj_num_`. That is not always GetLastObjNum() + 1: when every new
++      // object is unreferenced (and therefore not written), WriteOldObjs() sets
++      // `last_obj_num_` to the last object it wrote.
++      dwObjNum = last_obj_num_;
+     }
+     if (!archive_->WriteString(" ") || !archive_->WriteDWord(dwObjNum) ||
+         !archive_->WriteString(" 0 R ")) {
+diff --git a/core/fpdfapi/edit/cpdf_creator.h b/core/fpdfapi/edit/cpdf_creator.h
+index 55f9524..4528e80 100644
+--- a/core/fpdfapi/edit/cpdf_creator.h
++++ b/core/fpdfapi/edit/cpdf_creator.h
+@@ -11,6 +11,7 @@
+ 
+ #include <map>
+ #include <memory>
++#include <set>
+ #include <vector>
+ 
+ #include "core/fxcrt/fx_stream.h"
+@@ -94,6 +95,9 @@ class CPDF_Creator {
+   FX_FILESIZE xref_start_ = 0;
+   std::map<uint32_t, FX_FILESIZE> object_offsets_;
+   std::vector<uint32_t> new_obj_num_array_;  // Sorted, ascending.
++  // Objects reachable from the trailer; only filled for a full save, which
++  // writes nothing else.
++  std::set<uint32_t> objects_with_refs_;
+   RetainPtr<CPDF_Array> id_array_;
+   int32_t file_version_ = 0;
+   bool security_changed_ = false;
+diff --git a/core/fpdfapi/parser/cpdf_security_handler_embeddertest.cpp b/core/fpdfapi/parser/cpdf_security_handler_embeddertest.cpp
+index 3dfc2ae..fb92384 100644
+--- a/core/fpdfapi/parser/cpdf_security_handler_embeddertest.cpp
++++ b/core/fpdfapi/parser/cpdf_security_handler_embeddertest.cpp
+@@ -8,6 +8,7 @@
+ #include "build/build_config.h"
+ #include "core/fpdfapi/parser/cpdf_dictionary.h"
+ #include "core/fpdfapi/parser/cpdf_document.h"
++#include "core/fpdfapi/parser/cpdf_name.h"
+ #include "core/fpdfapi/parser/cpdf_parser.h"
+ #include "core/fxcrt/fx_system.h"
+ #include "core/fxge/cfx_renderdevice.h"
+@@ -291,6 +292,25 @@ TEST_F(CPDFSecurityHandlerEmbedderTest, OwnerPasswordVersion3UTF8) {
+   VerifySavedModifiedHelloWorldDocumentWithPassword(kAgeUTF8);
+ }
+ 
++TEST_F(CPDFSecurityHandlerEmbedderTest,
++       SaveWithUnreferencedNewObjectVersion3) {
++  // A full save of a revision 2 or 3 document writes a new, direct /Encrypt
++  // dictionary as the object after the last one it writes. A new object that
++  // nothing refers to is not written, so the trailer must name that object
++  // number, not the one after the document's last object number.
++  OpenAndVerifyHelloWorldDocumentWithPassword("encrypted_hello_world_r3.pdf",
++                                              kAgeLatin1);
++  // Cheating slightly, as in RemoveTrailerIdFromDocument().
++  CPDF_Document* doc = reinterpret_cast<CPDF_Document*>(document());
++  ASSERT_TRUE(doc);
++  auto orphan = doc->NewIndirect<CPDF_Dictionary>();
++  orphan->SetNewFor<CPDF_Name>("Type", "PSEOrphan");
++
++  EXPECT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
++  VerifySavedHelloWorldDocumentWithPassword(kAgeLatin1);
++  VerifySavedHelloWorldDocumentWithPassword(kHotelLatin1);
++}
++
+ TEST_F(CPDFSecurityHandlerEmbedderTest, OwnerPasswordVersion3Latin1) {
+   // Same as OwnerPasswordVersion2Latin1 test above.
+   OpenAndVerifyHelloWorldDocumentWithPassword("encrypted_hello_world_r3.pdf",
+diff --git a/fpdfsdk/fpdf_save_embeddertest.cpp b/fpdfsdk/fpdf_save_embeddertest.cpp
+index d7e849a..4c2e8f5 100644
+--- a/fpdfsdk/fpdf_save_embeddertest.cpp
++++ b/fpdfsdk/fpdf_save_embeddertest.cpp
+@@ -8,10 +8,18 @@
+ #include <string>
+ #include <vector>
+ 
++#include "core/fpdfapi/parser/cpdf_dictionary.h"
++#include "core/fpdfapi/parser/cpdf_document.h"
++#include "core/fpdfapi/parser/cpdf_name.h"
++#include "core/fpdfapi/parser/cpdf_reference.h"
++#include "core/fpdfapi/parser/cpdf_string.h"
+ #include "core/fxcrt/fx_coordinates.h"
+ #include "core/fxcrt/fx_string.h"
+ #include "core/fxcrt/span.h"
++#include "fpdfsdk/cpdfsdk_helpers.h"
+ #include "public/cpp/fpdf_scopers.h"
++#include "public/fpdf_annot.h"
++#include "public/fpdf_doc.h"
+ #include "public/fpdf_edit.h"
+ #include "public/fpdf_ppo.h"
+ #include "public/fpdf_save.h"
+@@ -30,6 +38,20 @@ using testing::HasSubstr;
+ using testing::Not;
+ using testing::StartsWith;
+ 
++namespace {
++
++// Number of indirect objects in a document written by CPDF_Creator.
++int CountWrittenObjects(const std::string& pdf) {
++  int count = 0;
++  for (size_t pos = pdf.find(" 0 obj\r\n"); pos != std::string::npos;
++       pos = pdf.find(" 0 obj\r\n", pos + 1)) {
++    ++count;
++  }
++  return count;
++}
++
++}  // namespace
++
+ class FPDFSaveEmbedderTest : public EmbedderTest {};
+ 
+ TEST_F(FPDFSaveEmbedderTest, SaveSimpleDoc) {
+@@ -77,6 +99,115 @@ TEST_F(FPDFSaveEmbedderTest, SaveSimpleDocNoIncremental) {
+   EXPECT_EQ(805u, GetString().size());
+ }
+ 
++TEST_F(FPDFSaveEmbedderTest, SaveSkipsUnreferencedNewObjects) {
++  ASSERT_TRUE(OpenDocument("hello_world.pdf"));
++  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, FPDF_NO_INCREMENTAL));
++  const size_t plain_size = GetString().size();
++  ClearString();
++
++  CPDF_Document* doc = CPDFDocumentFromFPDFDocument(document());
++  auto orphan = doc->NewIndirect<CPDF_Dictionary>();
++  orphan->SetNewFor<CPDF_Name>("Type", "PSEOrphan");
++  auto kept = doc->NewIndirect<CPDF_Dictionary>();
++  kept->SetNewFor<CPDF_Name>("Type", "PSEKept");
++
++  // Neither is referenced: a full save writes neither.
++  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, FPDF_NO_INCREMENTAL));
++  EXPECT_EQ(plain_size, GetString().size());
++  EXPECT_THAT(GetString(), Not(HasSubstr("PSEOrphan")));
++  EXPECT_THAT(GetString(), Not(HasSubstr("PSEKept")));
++  ClearString();
++
++  // Once the catalog refers to one of them, that one is written.
++  doc->GetMutableRoot()->SetNewFor<CPDF_Reference>("PSEKept", doc,
++                                                   kept->GetObjNum());
++  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, FPDF_NO_INCREMENTAL));
++  EXPECT_THAT(GetString(), HasSubstr("/Type/PSEKept"));
++  EXPECT_THAT(GetString(), Not(HasSubstr("PSEOrphan")));
++  ClearString();
++
++  // An incremental save still writes every new object.
++  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, FPDF_INCREMENTAL));
++  EXPECT_THAT(GetString(), HasSubstr("PSEOrphan"));
++}
++
++TEST_F(FPDFSaveEmbedderTest, SaveNewDocSkipsUnreferencedNewObjects) {
++  // A document without a parser (FPDF_CreateNewDocument()): every object is
++  // new, and a full save writes the ones reachable from /Root and /Info.
++  ScopedFPDFDocument new_doc(FPDF_CreateNewDocument());
++  ASSERT_TRUE(new_doc);
++  {
++    ScopedFPDFPage page(FPDFPage_New(new_doc.get(), 0, 612, 792));
++    ASSERT_TRUE(page);
++  }
++  ASSERT_TRUE(FPDF_SaveAsCopy(new_doc.get(), this, FPDF_NO_INCREMENTAL));
++  const int plain_objects = CountWrittenObjects(GetString());
++  ClearString();
++
++  CPDF_Document* doc = CPDFDocumentFromFPDFDocument(new_doc.get());
++  auto orphan = doc->NewIndirect<CPDF_Dictionary>();
++  orphan->SetNewFor<CPDF_Name>("Type", "PSEOrphan");
++  // An indirect object that only /Info refers to is written.
++  auto producer = doc->NewIndirect<CPDF_String>("PSEProducer");
++  doc->GetInfo()->SetNewFor<CPDF_Reference>("Producer", doc,
++                                            producer->GetObjNum());
++
++  ASSERT_TRUE(FPDF_SaveAsCopy(new_doc.get(), this, FPDF_NO_INCREMENTAL));
++  EXPECT_THAT(GetString(), Not(HasSubstr("PSEOrphan")));
++  EXPECT_THAT(GetString(), HasSubstr("(PSEProducer)"));
++  EXPECT_EQ(plain_objects + 1, CountWrittenObjects(GetString()));
++
++  ScopedSavedDoc saved = OpenScopedSavedDocument();
++  ASSERT_TRUE(saved);
++  EXPECT_EQ(1, FPDF_GetPageCount(saved.get()));
++  unsigned short buffer[32];
++  ASSERT_EQ(24u,
++            FPDF_GetMetaText(saved.get(), "Producer", buffer, sizeof(buffer)));
++  EXPECT_EQ(L"PSEProducer", GetPlatformWString(buffer));
++}
++
++TEST_F(FPDFSaveEmbedderTest, SaveImportedPagesSkipsReplacedAppearances) {
++  // Pages imported into a new document (split / combine), rendered with
++  // FPDF_ANNOT: dropping a generated appearance and rendering again replaces
++  // it, and a full save does not write the replaced streams.
++  ASSERT_TRUE(OpenDocument("annotation_highlight_long_content.pdf"));
++  ScopedFPDFDocument new_doc(FPDF_CreateNewDocument());
++  ASSERT_TRUE(new_doc);
++  ASSERT_TRUE(FPDF_ImportPages(new_doc.get(), document(), "1", 0));
++  ScopedFPDFPage page(FPDF_LoadPage(new_doc.get(), 0));
++  ASSERT_TRUE(page);
++
++  auto drop_appearance_and_render = [&page]() {
++    {
++      ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), 0));
++      ASSERT_TRUE(annot);
++      ASSERT_TRUE(FPDFAnnot_SetAP(annot.get(), FPDF_ANNOT_APPEARANCEMODE_NORMAL,
++                                  nullptr));
++    }
++    ScopedFPDFBitmap bitmap =
++        RenderPageWithFlags(page.get(), nullptr, FPDF_ANNOT);
++    ASSERT_TRUE(bitmap);
++  };
++
++  // The highlight now has an appearance PDFium generated.
++  drop_appearance_and_render();
++  ASSERT_TRUE(FPDF_SaveAsCopy(new_doc.get(), this, FPDF_NO_INCREMENTAL));
++  const int objects = CountWrittenObjects(GetString());
++  ClearString();
++
++  for (int i = 0; i < 3; ++i) {
++    drop_appearance_and_render();
++  }
++  ASSERT_TRUE(FPDF_SaveAsCopy(new_doc.get(), this, FPDF_NO_INCREMENTAL));
++  EXPECT_EQ(objects, CountWrittenObjects(GetString()));
++
++  ScopedSavedDoc saved = OpenScopedSavedDocument();
++  ASSERT_TRUE(saved);
++  ScopedSavedPage saved_page = LoadScopedSavedPage(0);
++  ASSERT_TRUE(saved_page);
++  EXPECT_EQ(1, FPDFPage_GetAnnotCount(saved_page.get()));
++}
++
+ TEST_F(FPDFSaveEmbedderTest, SaveSimpleDocRemoveSecurityDeprecated) {
+   ASSERT_TRUE(OpenDocument("hello_world.pdf"));
+   EXPECT_TRUE(FPDF_SaveWithVersion(document(), this,
