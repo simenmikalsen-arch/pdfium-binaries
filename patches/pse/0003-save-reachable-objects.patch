@@ -170,7 +170,7 @@ index 55f9524..4528e80 100644
    int32_t file_version_ = 0;
    bool security_changed_ = false;
 diff --git a/core/fpdfapi/parser/cpdf_security_handler_embeddertest.cpp b/core/fpdfapi/parser/cpdf_security_handler_embeddertest.cpp
-index 3dfc2ae..fb92384 100644
+index 3dfc2ae..0bf40b4 100644
 --- a/core/fpdfapi/parser/cpdf_security_handler_embeddertest.cpp
 +++ b/core/fpdfapi/parser/cpdf_security_handler_embeddertest.cpp
 @@ -8,6 +8,7 @@
@@ -181,18 +181,20 @@ index 3dfc2ae..fb92384 100644
  #include "core/fpdfapi/parser/cpdf_parser.h"
  #include "core/fxcrt/fx_system.h"
  #include "core/fxge/cfx_renderdevice.h"
-@@ -291,6 +292,25 @@ TEST_F(CPDFSecurityHandlerEmbedderTest, OwnerPasswordVersion3UTF8) {
+@@ -291,6 +292,29 @@ TEST_F(CPDFSecurityHandlerEmbedderTest, OwnerPasswordVersion3UTF8) {
    VerifySavedModifiedHelloWorldDocumentWithPassword(kAgeUTF8);
  }
  
 +TEST_F(CPDFSecurityHandlerEmbedderTest,
 +       SaveWithUnreferencedNewObjectVersion3) {
-+  // A full save of a revision 2 or 3 document writes a new, direct /Encrypt
-+  // dictionary as the object after the last one it writes. A new object that
-+  // nothing refers to is not written, so the trailer must name that object
-+  // number, not the one after the document's last object number.
++  // Without a trailer /ID, a full save of a revision 2 or 3 document re-creates
++  // the /Encrypt dictionary as a direct one (InitID()) and writes it as the
++  // object after the last one it writes. A new object that nothing refers to
++  // is not written, so the trailer must name that object number, not the one
++  // after the document's last object number.
 +  OpenAndVerifyHelloWorldDocumentWithPassword("encrypted_hello_world_r3.pdf",
 +                                              kAgeLatin1);
++  RemoveTrailerIdFromDocument();
 +  // Cheating slightly, as in RemoveTrailerIdFromDocument().
 +  CPDF_Document* doc = reinterpret_cast<CPDF_Document*>(document());
 +  ASSERT_TRUE(doc);
@@ -200,8 +202,10 @@ index 3dfc2ae..fb92384 100644
 +  orphan->SetNewFor<CPDF_Name>("Type", "PSEOrphan");
 +
 +  EXPECT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
++  // As in OwnerPasswordVersion3Latin1: without the old ID only the owner
++  // password is valid in the copy.
 +  VerifySavedHelloWorldDocumentWithPassword(kAgeLatin1);
-+  VerifySavedHelloWorldDocumentWithPassword(kHotelLatin1);
++  VerifySavedHelloWorldDocumentWithPassword(kAgeUTF8);
 +}
 +
  TEST_F(CPDFSecurityHandlerEmbedderTest, OwnerPasswordVersion3Latin1) {

@@ -53,9 +53,10 @@ was written. `0003-save-reachable-objects.patch` changes `core/fpdfapi/edit/cpdf
 * The same for documents without a parser (`FPDF_CreateNewDocument()`, e.g. with imported pages from
   split / combine / `FPDF_ImportPages`): reachable from `/Root` and `/Info`, the two entries such a
   trailer has.
-* The trailer's `/Encrypt` reference of a direct (revision 2/3, re-created) encryption dictionary names the
-  object number it was actually written as (`last_obj_num_`), not `GetLastObjNum() + 1`: the two differ once
-  unreferenced new objects are skipped.
+* The trailer's `/Encrypt` reference of a DIRECT encryption dictionary (one written directly in the file's trailer,
+  or the one `InitID()` re-creates for a revision 2/3 document without a trailer `/ID`) names the object number it
+  was actually written as (`last_obj_num_`), not `GetLastObjNum() + 1`: the two differ once unreferenced new objects
+  are skipped, and the saved file's `/Encrypt` would point nowhere.
 
 Incremental saves are unchanged (they write every new object). New embedder tests:
 `FPDFSaveEmbedderTest.SaveSkipsUnreferencedNewObjects`, `.SaveNewDocSkipsUnreferencedNewObjects`,
