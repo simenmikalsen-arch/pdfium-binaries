@@ -53,7 +53,7 @@ index a59f959..c64bb05 100644
    const ByteString kContents =
        MakeByteString({0xFE, 0xFF, 0x00, 0x1B, 'j', 'a', 0x00, 0x1B});
 diff --git a/fpdfsdk/fpdf_annot_embeddertest.cpp b/fpdfsdk/fpdf_annot_embeddertest.cpp
-index 470b1f1..77e4091 100644
+index 470b1f1..059285d 100644
 --- a/fpdfsdk/fpdf_annot_embeddertest.cpp
 +++ b/fpdfsdk/fpdf_annot_embeddertest.cpp
 @@ -445,6 +445,28 @@ TEST_F(FPDFAnnotEmbedderTest, RenderAnnotWithOnlyRolloverAP) {
@@ -85,3 +85,26 @@ index 470b1f1..77e4091 100644
  TEST_F(FPDFAnnotEmbedderTest, RenderMultilineMarkupAnnotWithoutAP) {
    // Open a file with multiline markup annotations.
    ASSERT_TRUE(OpenDocument("annotation_markup_multiline_no_ap.pdf"));
+@@ -2007,7 +2029,9 @@ TEST_F(FPDFAnnotEmbedderTest, GetFormAnnotAndCheckFlagsComboBox) {
+ }
+ 
+ TEST_F(FPDFAnnotEmbedderTest, Bug1206) {
+-  static constexpr size_t kExpectedMinimumOriginalSize = 1601;
++  // Without the objects of the popup appearance the form-fill environment's
++  // page view used to generate when the page was loaded.
++  static constexpr size_t kExpectedMinimumOriginalSize = 1000;
+ 
+   ASSERT_TRUE(OpenDocument("bug_1206.pdf"));
+ 
+@@ -2024,9 +2048,8 @@ TEST_F(FPDFAnnotEmbedderTest, Bug1206) {
+     CompareBitmapWithExpectationSuffix(bitmap.get(), "bug_1206");
+ 
+     ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
+-    // TODO(https://crbug.com/42270200): This is wrong. The size should be
+-    // equal, not bigger.
+-    EXPECT_GT(GetString().size(), original_size);
++    // https://crbug.com/42270200: rendering must not grow the saved document.
++    EXPECT_EQ(GetString().size(), original_size);
+     ClearString();
+   }
+ }

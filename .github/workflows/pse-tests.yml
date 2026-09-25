@@ -81,7 +81,7 @@ jobs:
         shell: bash
         run: |
           pdfium/out/Release/pdfium_unittests --gtest_filter='CPDFAnnotListTest.*' > patched-annotlist.log 2>&1 || true
-          grep -h -E '^\[( +OK|  FAILED  ) \] (FPDFAnnotEmbedderTest.RenderAddsNoPopupObjectsToDocument|FPDFSaveEmbedderTest.SaveSkipsUnreferencedNewObjects)' patched-embeddertests-*.log > patched-spike-embedder.log || true
+          grep -h -E '^\[( +OK|  FAILED  ) \] (FPDFAnnotEmbedderTest.RenderAddsNoPopupObjectsToDocument|FPDFSaveEmbedderTest.SaveSkipsUnreferencedNewObjects|FPDFAnnotEmbedderTest.Bug1206)' patched-embeddertests-*.log > patched-spike-embedder.log || true
           echo "Failures without the patch:"; cat unpatched-failures.txt
           echo "Failures with the patch:"; cat patched-failures.txt
           comm -13 unpatched-failures.txt patched-failures.txt > new-failures.txt
@@ -101,6 +101,7 @@ jobs:
           grep -q '^\[       OK \] CPDFAnnotListTest.CreatePopupAnnotAddsNoObjectsToDocument' patched-annotlist.log
           grep -q '^\[       OK \] FPDFAnnotEmbedderTest.RenderAddsNoPopupObjectsToDocument' patched-spike-embedder.log
           grep -q '^\[       OK \] FPDFSaveEmbedderTest.SaveSkipsUnreferencedNewObjects' patched-spike-embedder.log
+          grep -q '^\[       OK \] FPDFAnnotEmbedderTest.Bug1206' patched-spike-embedder.log
           [ ! -s new-failures.txt ]
       - name: Upload logs
         if: always()

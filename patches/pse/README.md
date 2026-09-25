@@ -38,3 +38,6 @@ dictionary per markup per render call, never referenced, but written by every fu
   computed once and shared). One new embedder test.
 
 The DLL says `-pse1bloatspike` in its ProductVersion.
+`FPDFAnnotEmbedderTest.Bug1206` (https://crbug.com/42270200, "rendering an annotation grows the saved file") asserted the
+bug (`EXPECT_GT` with a TODO saying the size should be equal); 0002 changes it to `EXPECT_EQ` - either patch alone makes
+it pass. Upstream `main` (2026-09-24) still has the TODO.
