@@ -31,6 +31,9 @@ apply_patch "$PATCHES/clang_rt.patch" build
 # Patched build for PDF Studio Elite: GenerateContent performance.
 # See patches/pse/README.md.
 apply_patch "$PATCHES/pse/0001-generatecontent-perf.patch"
+# Popup / render bloat SPIKE (not for release): see patches/pse/README.md.
+apply_patch "$PATCHES/pse/0002-popup-lazy-appearance-spike.patch"
+apply_patch "$PATCHES/pse/0003-save-reachable-objects-spike.patch"
 
 [ "$ENABLE_V8" == "true" ] && apply_patch "$PATCHES/v8/pdfium.patch"
 

@@ -23,3 +23,18 @@ before and after applying the patch and fails on new test failures.
 Build for a new PDFium release: rebase this branch onto the new bblanchon tag
 (`chromium/NNNN`), then run the "Build one" workflow with `branch=chromium/NNNN`,
 `version=<major>.0.NNNN.0`, `target_os=win`, `target_cpu=x64`.
+
+## 0002 + 0003 - popup / render bloat SPIKE (branch pse/popup-bloat-spike only, not for release)
+
+Prototypes for the PDF Studio Elite render-bloat spike (docs/RENDER-BLOAT-SPIKE.md in that repository). Every
+`CPDF_AnnotList` construction (every render call with `FPDF_ANNOT`) creates a Popup annotation for each markup with
+`/Contents`, and `CPDF_Annot`'s constructor generated its appearance at once: a new appearance stream and a new font
+dictionary per markup per render call, never referenced, but written by every full save.
+
+* `0002-popup-lazy-appearance-spike.patch`: a Popup's appearance is generated only when it is drawn (open), which
+  `DrawAppearance()` / `DrawInContext()` already do on demand. One new unit test, one new embedder test.
+* `0003-save-reachable-objects-spike.patch`: a full (non-incremental) save of a parsed document writes only the NEW
+  objects that are reachable from the trailer, exactly as it already does for the parsed ones (the reachability set is
+  computed once and shared). One new embedder test.
+
+The DLL says `-pse1bloatspike` in its ProductVersion.

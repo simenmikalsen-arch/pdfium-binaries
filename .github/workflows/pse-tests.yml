@@ -66,7 +66,10 @@ jobs:
         run: bash steps/pse-run-tests.sh unpatched
         shell: bash
       - name: Apply patch
-        run: patch --verbose -p1 -d pdfium -i "$PWD/patches/pse/0001-generatecontent-perf.patch"
+        run: |
+          patch --verbose -p1 -d pdfium -i "$PWD/patches/pse/0001-generatecontent-perf.patch"
+          patch --verbose -p1 -d pdfium -i "$PWD/patches/pse/0002-popup-lazy-appearance-spike.patch"
+          patch --verbose -p1 -d pdfium -i "$PWD/patches/pse/0003-save-reachable-objects-spike.patch"
         shell: bash
       - name: Build tests (patched)
         run: ninja -C pdfium/out/Release pdfium_unittests pdfium_embeddertests
@@ -77,6 +80,8 @@ jobs:
       - name: Compare
         shell: bash
         run: |
+          pdfium/out/Release/pdfium_unittests --gtest_filter='CPDFAnnotListTest.*' > patched-annotlist.log 2>&1 || true
+          grep -h -E '^\[( +OK|  FAILED  ) \] (FPDFAnnotEmbedderTest.RenderAddsNoPopupObjectsToDocument|FPDFSaveEmbedderTest.SaveSkipsUnreferencedNewObjects)' patched-embeddertests-*.log > patched-spike-embedder.log || true
           echo "Failures without the patch:"; cat unpatched-failures.txt
           echo "Failures with the patch:"; cat patched-failures.txt
           comm -13 unpatched-failures.txt patched-failures.txt > new-failures.txt
@@ -88,9 +93,14 @@ jobs:
             echo '```'
             cat new-failures.txt
             grep -E '^\[( +OK|  FAILED  ) \] CPDFPageContentGeneratorTest' patched-generator.log || true
+            grep -E '^\[( +OK|  FAILED  ) \] CPDFAnnotListTest' patched-annotlist.log || true
+            cat patched-spike-embedder.log
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           grep -q '^\[       OK \] CPDFPageContentGeneratorTest.KeepXObjectNames' patched-generator.log
+          grep -q '^\[       OK \] CPDFAnnotListTest.CreatePopupAnnotAddsNoObjectsToDocument' patched-annotlist.log
+          grep -q '^\[       OK \] FPDFAnnotEmbedderTest.RenderAddsNoPopupObjectsToDocument' patched-spike-embedder.log
+          grep -q '^\[       OK \] FPDFSaveEmbedderTest.SaveSkipsUnreferencedNewObjects' patched-spike-embedder.log
           [ ! -s new-failures.txt ]
       - name: Upload logs
         if: always()
