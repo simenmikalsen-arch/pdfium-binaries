@@ -1,7 +1,7 @@
 # Patched build for PDF Studio Elite
 
-Three patches, applied in order by `steps/03-patch.sh` for every target. The DLL is marked by
-`patches/win/resources.rc` (`FileDescription` names the patches, `ProductVersion` suffix `-pse2`;
+Four patches, applied in order by `steps/03-patch.sh` for every target. The DLL is marked by
+`patches/win/resources.rc` (`FileDescription` names the patches, `ProductVersion` suffix `-pse3`;
 `FileVersion` stays the numeric PDFium version). Everything else is identical to the upstream
 bblanchon/pdfium-binaries build.
 
@@ -64,3 +64,46 @@ Incremental saves are unchanged (they write every new object). New embedder test
 
 `.github/workflows/pse-tests.yml` requires all of the new tests, `Bug1206` and 0001's `KeepXObjectNames` to pass, and
 no test that passes without the patches to fail with them. Upstream `main` (2026-09-24) still has both problems.
+
+## 0004 - save-omits-generated-appearances
+
+When PDFium draws an annotation that has no appearance stream (a render with `FPDF_ANNOT`, a form-fill page
+view), `CPDF_Annot` generates one, writes it into the annotation dictionary as `/AP` and marks the dictionary with
+`/PDFIUM_HasGeneratedAP true`. A save wrote both, so what a save wrote depended on which pages had been drawn
+(a 5,000-markup sheet: 2.0 MB saved before any render, 4.4 MB after), and PDFium's private key ended up in files.
+`0004-save-omits-generated-appearances.patch`:
+
+* `CPDF_Dictionary::WriteTo()` (every save) skips `/AP` and `/PDFIUM_HasGeneratedAP` of a dictionary marked this
+  way (`CPDF_Dictionary::HasGeneratedAppearance()`); the key is now `pdfium::annotation::kPDFiumHasGeneratedAP`
+  in `constants/annotation_common.h`. The in-memory dictionary is untouched: drawing keeps using the appearance.
+* Generating an ink or text appearance changes `/Rect` (inflated by half the border width / a 20 x 20 icon):
+  `CPDF_Annot` keeps the original `/Rect` in `/PDFIUM_RectBeforeGeneratedAP`, which a save writes as `/Rect`
+  (and never under its own key). Removing the generated appearance (`FPDFAnnot_SetAP(NORMAL, nullptr)`,
+  `FPDFAnnot_SetBorder()`, `FPDFAnnot_SetFontColor()`) restores it, so the next generation starts from the same
+  dictionary instead of inflating an ink annotation again; `FPDFAnnot_SetRect()` drops it (the caller's `/Rect`
+  is saved).
+* Drawing a free text annotation no longer adds an `/AcroForm` to a document that has none, nor a fallback font
+  to the document's `/DR`: the appearance refers to its font directly. `FPDFAnnotEmbedderTest.SetFontColor` relied on
+  that side effect (it read the font colour of a free text without `/DA` from the `/AcroForm` that drawing had added);
+  it now expects no colour until `FPDFAnnot_SetFontColor()` sets one.
+* The reachable-object traversal of a full save (`GetObjectsWithReferences()`, 0003's `/Info` traversal) does not
+  follow such an `/AP`, so the generated streams (and the fonts only they use) are not written either.
+  `GetObjectsWithMultipleReferences()` (used by the content generator) still follows it.
+* `FPDFAnnot_SetAP()` for the normal mode and `FPDFAnnot_AppendObject()` / `UpdateObject()` / `RemoveObject()`
+  remove the mark: an appearance the caller set or changed is the annotation's own and is saved.
+* Widgets: an appearance the form-fill environment makes for a widget whose value did not change and that had none
+  (`CPDFSDK_Widget::ResetAppearance(..., kValueUnchanged)`, e.g. `CPDFSDK_Widget::OnLoad()` when the page gets a page
+  view) and the one `CPDF_AnnotList` makes for a widget without an appearance under `/NeedAppearances` are marked the
+  same way, so an untouched field is saved as it came. A value change (`ResetAppearance(..., kValueChanged)`,
+  `CPDFSDK_InteractiveForm::UpdateField()` - typing, a check box / radio click, a choice, a form reset) makes the
+  appearance the widget's own, and it is saved. A widget that already had an appearance is regenerated and saved as
+  before (e.g. under `/NeedAppearances`).
+* New experimental API (`public/fpdf_annot.h`): `FPDFAnnot_GenerateAP()` generates the normal appearance from the
+  dictionary now, the way drawing would, as the annotation's own appearance (saved);
+  `FPDFAnnot_MarkGeneratedAP(annot, generated)` marks or unmarks the current appearance as generated.
+
+A dictionary that already carries the mark when the document is loaded (written by an earlier PDFium-based save)
+is treated the same way: its `/AP` is PDFium's regenerable cache and is not written. New embedder tests:
+`FPDFAnnotEmbedderTest.SaveOmitsGeneratedAppearances`, `.GenerateAPIsSaved`, `.MarkGeneratedAPAndSetAP`,
+`.SaveKeepsRectOfGeneratedInkAppearance`, `.DrawingFreeTextAddsNoAcroForm`,
+`.SaveOmitsGeneratedAppearanceOfNewAnnotation`, `.SaveOmitsGeneratedWidgetAppearance`.

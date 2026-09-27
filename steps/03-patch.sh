@@ -30,10 +30,11 @@ apply_patch "$PATCHES/clang_rt.patch" build
 
 # Patched build for PDF Studio Elite (see patches/pse/README.md):
 # GenerateContent performance, lazy popup appearances, full save writes only
-# reachable objects.
+# reachable objects, a save omits generated appearances.
 apply_patch "$PATCHES/pse/0001-generatecontent-perf.patch"
 apply_patch "$PATCHES/pse/0002-popup-lazy-appearance.patch"
 apply_patch "$PATCHES/pse/0003-save-reachable-objects.patch"
+apply_patch "$PATCHES/pse/0004-save-omits-generated-appearances.patch"
 
 [ "$ENABLE_V8" == "true" ] && apply_patch "$PATCHES/v8/pdfium.patch"
 
