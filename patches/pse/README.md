@@ -91,6 +91,13 @@ view), `CPDF_Annot` generates one, writes it into the annotation dictionary as `
   `GetObjectsWithMultipleReferences()` (used by the content generator) still follows it.
 * `FPDFAnnot_SetAP()` for the normal mode and `FPDFAnnot_AppendObject()` / `UpdateObject()` / `RemoveObject()`
   remove the mark: an appearance the caller set or changed is the annotation's own and is saved.
+* Widgets: an appearance the form-fill environment makes for a widget whose value did not change and that had none
+  (`CPDFSDK_Widget::ResetAppearance(..., kValueUnchanged)`, e.g. `CPDFSDK_Widget::OnLoad()` when the page gets a page
+  view) and the one `CPDF_AnnotList` makes for a widget without an appearance under `/NeedAppearances` are marked the
+  same way, so an untouched field is saved as it came. A value change (`ResetAppearance(..., kValueChanged)`,
+  `CPDFSDK_InteractiveForm::UpdateField()` - typing, a check box / radio click, a choice, a form reset) makes the
+  appearance the widget's own, and it is saved. A widget that already had an appearance is regenerated and saved as
+  before (e.g. under `/NeedAppearances`).
 * New experimental API (`public/fpdf_annot.h`): `FPDFAnnot_GenerateAP()` generates the normal appearance from the
   dictionary now, the way drawing would, as the annotation's own appearance (saved);
   `FPDFAnnot_MarkGeneratedAP(annot, generated)` marks or unmarks the current appearance as generated.
@@ -99,4 +106,4 @@ A dictionary that already carries the mark when the document is loaded (written 
 is treated the same way: its `/AP` is PDFium's regenerable cache and is not written. New embedder tests:
 `FPDFAnnotEmbedderTest.SaveOmitsGeneratedAppearances`, `.GenerateAPIsSaved`, `.MarkGeneratedAPAndSetAP`,
 `.SaveKeepsRectOfGeneratedInkAppearance`, `.DrawingFreeTextAddsNoAcroForm`,
-`.SaveOmitsGeneratedAppearanceOfNewAnnotation`.
+`.SaveOmitsGeneratedAppearanceOfNewAnnotation`, `.SaveOmitsGeneratedWidgetAppearance`.

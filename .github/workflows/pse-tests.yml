@@ -82,7 +82,7 @@ jobs:
         shell: bash
         run: |
           pdfium/out/Release/pdfium_unittests --gtest_filter='CPDFAnnotListTest.*' > patched-annotlist.log 2>&1 || true
-          grep -h -E '^\[( +OK|  FAILED  ) \] (FPDFAnnotEmbedderTest.RenderAddsNoPopupObjectsToDocument|FPDFAnnotEmbedderTest.Bug1206|FPDFSaveEmbedderTest.SaveSkipsUnreferencedNewObjects|FPDFSaveEmbedderTest.SaveNewDocSkipsUnreferencedNewObjects|FPDFSaveEmbedderTest.SaveImportedPagesSkipsReplacedAppearances|CPDFSecurityHandlerEmbedderTest.SaveWithUnreferencedNewObjectVersion3|FPDFAnnotEmbedderTest.SaveOmitsGeneratedAppearances|FPDFAnnotEmbedderTest.GenerateAPIsSaved|FPDFAnnotEmbedderTest.MarkGeneratedAPAndSetAP|FPDFAnnotEmbedderTest.SaveOmitsGeneratedAppearanceOfNewAnnotation|FPDFAnnotEmbedderTest.SaveKeepsRectOfGeneratedInkAppearance|FPDFAnnotEmbedderTest.DrawingFreeTextAddsNoAcroForm|FPDFAnnotEmbedderTest.SetFontColor)' patched-embeddertests-*.log > patched-pse-embedder.log || true
+          grep -h -E '^\[( +OK|  FAILED  ) \] (FPDFAnnotEmbedderTest.RenderAddsNoPopupObjectsToDocument|FPDFAnnotEmbedderTest.Bug1206|FPDFSaveEmbedderTest.SaveSkipsUnreferencedNewObjects|FPDFSaveEmbedderTest.SaveNewDocSkipsUnreferencedNewObjects|FPDFSaveEmbedderTest.SaveImportedPagesSkipsReplacedAppearances|CPDFSecurityHandlerEmbedderTest.SaveWithUnreferencedNewObjectVersion3|FPDFAnnotEmbedderTest.SaveOmitsGeneratedAppearances|FPDFAnnotEmbedderTest.GenerateAPIsSaved|FPDFAnnotEmbedderTest.MarkGeneratedAPAndSetAP|FPDFAnnotEmbedderTest.SaveOmitsGeneratedAppearanceOfNewAnnotation|FPDFAnnotEmbedderTest.SaveKeepsRectOfGeneratedInkAppearance|FPDFAnnotEmbedderTest.DrawingFreeTextAddsNoAcroForm|FPDFAnnotEmbedderTest.SetFontColor|FPDFAnnotEmbedderTest.SaveOmitsGeneratedWidgetAppearance)' patched-embeddertests-*.log > patched-pse-embedder.log || true
           echo "Failures without the patch:"; cat unpatched-failures.txt
           echo "Failures with the patch:"; cat patched-failures.txt
           comm -13 unpatched-failures.txt patched-failures.txt > new-failures.txt
@@ -112,7 +112,8 @@ jobs:
                    FPDFAnnotEmbedderTest.SaveOmitsGeneratedAppearanceOfNewAnnotation \
                    FPDFAnnotEmbedderTest.SaveKeepsRectOfGeneratedInkAppearance \
                    FPDFAnnotEmbedderTest.DrawingFreeTextAddsNoAcroForm \
-                   FPDFAnnotEmbedderTest.SetFontColor; do
+                   FPDFAnnotEmbedderTest.SetFontColor \
+                   FPDFAnnotEmbedderTest.SaveOmitsGeneratedWidgetAppearance; do
             grep -q "^\[       OK \] $t " patched-pse-embedder.log || { echo "missing or failed: $t"; exit 1; }
           done
           [ ! -s new-failures.txt ]

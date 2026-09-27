@@ -289,6 +289,31 @@ index 13a9680..ed19501 100644
    has_generated_ap_ = true;
  }
  
+diff --git a/core/fpdfdoc/cpdf_annotlist.cpp b/core/fpdfdoc/cpdf_annotlist.cpp
+index c35c27e..fe1cd03 100644
+--- a/core/fpdfdoc/cpdf_annotlist.cpp
++++ b/core/fpdfdoc/cpdf_annotlist.cpp
+@@ -18,6 +18,7 @@
+ #include "core/fpdfapi/page/cpdf_occontext.h"
+ #include "core/fpdfapi/page/cpdf_page.h"
+ #include "core/fpdfapi/parser/cpdf_array.h"
++#include "core/fpdfapi/parser/cpdf_boolean.h"
+ #include "core/fpdfapi/parser/cpdf_dictionary.h"
+ #include "core/fpdfapi/parser/cpdf_document.h"
+ #include "core/fpdfapi/parser/cpdf_name.h"
+@@ -210,6 +211,12 @@ CPDF_AnnotList::CPDF_AnnotList(CPDF_Page* pPage)
+         CPDF_InteractiveForm::IsUpdateAPEnabled() &&
+         !dict->GetDictFor(pdfium::annotation::kAP)) {
+       GenerateAP(document_, dict.Get());
++      // Generated only to draw the widget (/NeedAppearances): like the
++      // appearances CPDF_Annot generates, a save does not write it.
++      if (dict->GetDictFor(pdfium::annotation::kAP)) {
++        dict->SetNewFor<CPDF_Boolean>(
++            pdfium::annotation::kPDFiumHasGeneratedAP, true);
++      }
+     }
+   }
+ 
 diff --git a/core/fpdfdoc/cpdf_generateap.cpp b/core/fpdfdoc/cpdf_generateap.cpp
 index 8c920b6..5a913d5 100644
 --- a/core/fpdfdoc/cpdf_generateap.cpp
@@ -321,6 +346,74 @@ index 8c920b6..5a913d5 100644
    auto* doc_page_data = CPDF_DocPageData::FromDocument(doc);
    RetainPtr<CPDF_Font> default_font = doc_page_data->GetFont(font_dict);
    if (!default_font) {
+diff --git a/fpdfsdk/cpdfsdk_interactiveform.cpp b/fpdfsdk/cpdfsdk_interactiveform.cpp
+index 41dcf0b..f74f5ad 100644
+--- a/fpdfsdk/cpdfsdk_interactiveform.cpp
++++ b/fpdfsdk/cpdfsdk_interactiveform.cpp
+@@ -14,6 +14,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include "constants/annotation_common.h"
+ #include "constants/annotation_flags.h"
+ #include "core/fpdfapi/page/cpdf_page.h"
+ #include "core/fpdfapi/parser/cfdf_document.h"
+@@ -368,6 +369,12 @@ void CPDFSDK_InteractiveForm::UpdateField(CPDF_FormField* pFormField) {
+       continue;
+     }
+ 
++    // The field's value changed: its widgets' appearances are theirs now, and
++    // a save writes them (also a check box's or radio button's appearance that
++    // was generated when its page got a page view).
++    pWidget->GetPDFAnnot()->GetMutableAnnotDict()->RemoveFor(
++        pdfium::annotation::kPDFiumHasGeneratedAP);
++
+     IPDF_Page* pPage = pWidget->GetPage();
+     FX_RECT rect =
+         formfiller->GetViewBBox(form_fill_env_->GetPageView(pPage), pWidget);
+diff --git a/fpdfsdk/cpdfsdk_widget.cpp b/fpdfsdk/cpdfsdk_widget.cpp
+index 6b92890..a29df1c 100644
+--- a/fpdfsdk/cpdfsdk_widget.cpp
++++ b/fpdfsdk/cpdfsdk_widget.cpp
+@@ -11,6 +11,7 @@
+ #include "constants/appearance.h"
+ #include "constants/form_flags.h"
+ #include "core/fpdfapi/parser/cpdf_array.h"
++#include "core/fpdfapi/parser/cpdf_boolean.h"
+ #include "core/fpdfapi/parser/cpdf_dictionary.h"
+ #include "core/fpdfapi/parser/cpdf_document.h"
+ #include "core/fpdfapi/parser/cpdf_reference.h"
+@@ -670,6 +671,17 @@ void CPDFSDK_Widget::ResetXFAAppearance(ValueChanged bValueChanged) {
+ 
+ void CPDFSDK_Widget::ResetAppearance(std::optional<WideString> sValue,
+                                      ValueChanged bValueChanged) {
++  // An appearance made for a widget whose value did not change and that had
++  // none (or only a generated one), e.g. when its page gets a page view, is
++  // marked like the appearances CPDF_Annot generates to draw an annotation: a
++  // save leaves the widget as it was. After a value change the appearance is
++  // the widget's own and is saved.
++  RetainPtr<CPDF_Dictionary> annot_dict = GetMutableAnnotDict();
++  const bool generated =
++      bValueChanged == kValueUnchanged &&
++      (!annot_dict->GetDictFor(pdfium::annotation::kAP) ||
++       annot_dict->HasGeneratedAppearance());
++
+   set_appearance_modified(true);
+ 
+   appearance_age_++;
+@@ -701,6 +713,12 @@ void CPDFSDK_Widget::ResetAppearance(std::optional<WideString> sValue,
+       break;
+   }
+ 
++  if (generated) {
++    annot_dict->SetNewFor<CPDF_Boolean>(
++        pdfium::annotation::kPDFiumHasGeneratedAP, true);
++  } else if (bValueChanged == kValueChanged) {
++    annot_dict->RemoveFor(pdfium::annotation::kPDFiumHasGeneratedAP);
++  }
+   ClearCachedAnnotAP();
+ }
+ 
 diff --git a/fpdfsdk/fpdf_annot.cpp b/fpdfsdk/fpdf_annot.cpp
 index fb5c862..6db29c0 100644
 --- a/fpdfsdk/fpdf_annot.cpp
@@ -485,10 +578,10 @@ index fb5c862..6db29c0 100644
    return true;
  }
 diff --git a/fpdfsdk/fpdf_annot_embeddertest.cpp b/fpdfsdk/fpdf_annot_embeddertest.cpp
-index 059285d..322c496 100644
+index 059285d..48fb73e 100644
 --- a/fpdfsdk/fpdf_annot_embeddertest.cpp
 +++ b/fpdfsdk/fpdf_annot_embeddertest.cpp
-@@ -478,6 +478,354 @@ TEST_F(FPDFAnnotEmbedderTest, RenderMultilineMarkupAnnotWithoutAP) {
+@@ -478,6 +478,407 @@ TEST_F(FPDFAnnotEmbedderTest, RenderMultilineMarkupAnnotWithoutAP) {
                                       "annotation_markup_multiline_no_ap");
  }
  
@@ -802,6 +895,59 @@ index 059285d..322c496 100644
 +  EXPECT_TRUE(SavedContains(GetString(), "/Helvetica"));
 +}
 +
++TEST_F(FPDFAnnotEmbedderTest, SaveOmitsGeneratedWidgetAppearance) {
++  // A text field without an appearance stream and without a value.
++  ASSERT_TRUE(OpenDocument("text_form.pdf"));
++  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
++  const std::string before = GetString();
++  ClearString();
++  EXPECT_FALSE(SavedContains(before, "/AP"));
++
++  // Its page view generates an appearance for it.
++  ScopedPage page = LoadScopedPage(0);
++  ASSERT_TRUE(page);
++  RenderLoadedPageWithFlags(page.get(), FPDF_ANNOT);
++  {
++    ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), 0));
++    ASSERT_TRUE(annot);
++    EXPECT_TRUE(FPDFAnnot_HasKey(annot.get(), pdfium::annotation::kAP));
++    EXPECT_TRUE(HasGeneratedAPMark(annot.get()));
++  }
++
++  // A save leaves the untouched field as it was.
++  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
++  const std::string untouched = GetString();
++  ClearString();
++  EXPECT_FALSE(SavedContains(untouched, "/AP"));
++  EXPECT_FALSE(
++      SavedContains(untouched, pdfium::annotation::kPDFiumHasGeneratedAP));
++  EXPECT_EQ(before.size(), untouched.size());
++
++  // A value typed into the field makes the appearance the widget's own.
++  {
++    ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), 0));
++    ASSERT_TRUE(annot);
++    ASSERT_TRUE(FORM_SetFocusedAnnot(form_handle(), annot.get()));
++    ScopedFPDFWideString text = GetFPDFWideString(L"Hello");
++    FORM_ReplaceSelection(form_handle(), page.get(), text.get());
++    ASSERT_TRUE(FORM_ForceToKillFocus(form_handle()));
++    EXPECT_TRUE(FPDFAnnot_HasKey(annot.get(), pdfium::annotation::kAP));
++    EXPECT_FALSE(HasGeneratedAPMark(annot.get()));
++  }
++  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
++  const std::string filled = GetString();
++  EXPECT_FALSE(
++      SavedContains(filled, pdfium::annotation::kPDFiumHasGeneratedAP));
++  ScopedFPDFDocument saved_doc = LoadWithoutFormFill(filled);
++  ASSERT_TRUE(saved_doc);
++  ScopedFPDFPage saved_page(FPDF_LoadPage(saved_doc.get(), 0));
++  ASSERT_TRUE(saved_page);
++  ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(saved_page.get(), 0));
++  ASSERT_TRUE(annot);
++  EXPECT_TRUE(FPDFAnnot_HasKey(annot.get(), pdfium::annotation::kAP));
++  EXPECT_TRUE(FPDFAnnot_HasKey(annot.get(), "V"));
++}
++
 +TEST_F(FPDFAnnotEmbedderTest, SaveOmitsGeneratedAppearanceOfNewAnnotation) {
 +  ASSERT_TRUE(OpenDocument("hello_world.pdf"));
 +  ScopedPage page = LoadScopedPage(0);
@@ -843,7 +989,7 @@ index 059285d..322c496 100644
  TEST_F(FPDFAnnotEmbedderTest, ExtractHighlightLongContent) {
    // Open a file with one annotation and load its first page.
    ASSERT_TRUE(OpenDocument("annotation_highlight_long_content.pdf"));
-@@ -2637,10 +2985,10 @@ TEST_F(FPDFAnnotEmbedderTest, SetFontColor) {
+@@ -2637,10 +3038,10 @@ TEST_F(FPDFAnnotEmbedderTest, SetFontColor) {
      unsigned int r = 1;
      unsigned int g = 2;
      unsigned int b = 3;
