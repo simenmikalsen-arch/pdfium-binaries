@@ -1,0 +1,616 @@
+diff --git a/constants/annotation_common.h b/constants/annotation_common.h
+index 890f84c..1f43dd0 100644
+--- a/constants/annotation_common.h
++++ b/constants/annotation_common.h
+@@ -25,6 +25,13 @@ inline constexpr char kC[] = "C";
+ inline constexpr char kStructParent[] = "StructParent";
+ inline constexpr char kOC[] = "OC";
+ 
++// Not in the spec: PDFium sets this entry (to true) in an annotation
++// dictionary whose normal appearance it generated only to draw the annotation
++// (CPDF_Annot::GenerateAPIfNeeded()). Such an appearance is a rendering cache:
++// a save writes neither the appearance (/AP) nor this entry
++// (CPDF_Dictionary::HasGeneratedAppearance()).
++inline constexpr char kPDFiumHasGeneratedAP[] = "PDFIUM_HasGeneratedAP";
++
+ // Entries for polygon and polyline annotations.
+ inline constexpr char kVertices[] = "Vertices";
+ 
+diff --git a/core/fpdfapi/edit/cpdf_creator.cpp b/core/fpdfapi/edit/cpdf_creator.cpp
+index c4daf66..874d593 100644
+--- a/core/fpdfapi/edit/cpdf_creator.cpp
++++ b/core/fpdfapi/edit/cpdf_creator.cpp
+@@ -123,7 +123,8 @@ bool OutputIndex(IFX_ArchiveStream* archive, FX_FILESIZE offset) {
+ }
+ 
+ // Adds `object` (if it is indirect) and every indirect object reachable from it
+-// to `objects`. Objects already in `objects` are not traversed again.
++// to `objects`. Objects already in `objects` are not traversed again. Like
++// GetObjectsWithReferences(), it does not follow generated appearances.
+ void AddReachableObjects(const CPDF_Document* document,
+                          RetainPtr<const CPDF_Object> object,
+                          std::set<uint32_t>* objects) {
+@@ -145,8 +146,15 @@ void AddReachableObjects(const CPDF_Document* document,
+         break;
+       }
+       case CPDF_Object::kDictionary: {
+-        CPDF_DictionaryLocker locker(current->AsDictionary());
++        const CPDF_Dictionary* dict = current->AsDictionary();
++        const bool skip_generated_appearance = dict->HasGeneratedAppearance();
++        CPDF_DictionaryLocker locker(dict);
+         for (const auto& it : locker) {
++          if (skip_generated_appearance &&
++              CPDF_Dictionary::IsGeneratedAppearanceEntry(
++                  it.first.AsStringView())) {
++            continue;
++          }
+           pending.push_back(it.second);
+         }
+         break;
+diff --git a/core/fpdfapi/parser/cpdf_dictionary.cpp b/core/fpdfapi/parser/cpdf_dictionary.cpp
+index de35427..3ba0816 100644
+--- a/core/fpdfapi/parser/cpdf_dictionary.cpp
++++ b/core/fpdfapi/parser/cpdf_dictionary.cpp
+@@ -9,6 +9,7 @@
+ #include <set>
+ #include <utility>
+ 
++#include "constants/annotation_common.h"
+ #include "core/fpdfapi/parser/cpdf_array.h"
+ #include "core/fpdfapi/parser/cpdf_boolean.h"
+ #include "core/fpdfapi/parser/cpdf_crypto_handler.h"
+@@ -260,6 +261,16 @@ bool CPDF_Dictionary::KeyExist(ByteStringView key) const {
+   return pdfium::Contains(map_, key);
+ }
+ 
++bool CPDF_Dictionary::HasGeneratedAppearance() const {
++  return GetBooleanFor(pdfium::annotation::kPDFiumHasGeneratedAP, false);
++}
++
++// static
++bool CPDF_Dictionary::IsGeneratedAppearanceEntry(ByteStringView key) {
++  return key == pdfium::annotation::kAP ||
++         key == pdfium::annotation::kPDFiumHasGeneratedAP;
++}
++
+ std::vector<ByteString> CPDF_Dictionary::GetKeys() const {
+   std::vector<ByteString> result;
+   CPDF_DictionaryLocker locker(this);
+@@ -359,11 +370,19 @@ bool CPDF_Dictionary::WriteTo(IFX_ArchiveStream* archive,
+   }
+ 
+   const bool is_signature = CPDF_CryptoHandler::IsSignatureDictionary(this);
++  // An appearance PDFium generated only to draw an annotation is not document
++  // content: the saved annotation stays as it was (without /AP), whether or
++  // not it was drawn before the save.
++  const bool skip_generated_appearance = HasGeneratedAppearance();
+ 
+   CPDF_DictionaryLocker locker(this);
+   for (const auto& it : locker) {
+     const ByteString& key = it.first;
+     const RetainPtr<CPDF_Object>& pValue = it.second;
++    if (skip_generated_appearance &&
++        IsGeneratedAppearanceEntry(key.AsStringView())) {
++      continue;
++    }
+     if (!archive->WriteString("/") ||
+         !archive->WriteString(PDF_NameEncode(key).AsStringView())) {
+       return false;
+diff --git a/core/fpdfapi/parser/cpdf_dictionary.h b/core/fpdfapi/parser/cpdf_dictionary.h
+index 092d775..ab18284 100644
+--- a/core/fpdfapi/parser/cpdf_dictionary.h
++++ b/core/fpdfapi/parser/cpdf_dictionary.h
+@@ -83,6 +83,15 @@ class CPDF_Dictionary final : public CPDF_Object {
+   bool KeyExist(ByteStringView key) const;
+   std::vector<ByteString> GetKeys() const;
+ 
++  // True for an annotation dictionary whose appearance PDFium generated only
++  // to draw it (pdfium::annotation::kPDFiumHasGeneratedAP). Serialising it
++  // (WriteTo(), i.e. saving the document) skips the entries for which
++  // IsGeneratedAppearanceEntry() is true, and a full save does not count the
++  // objects only they refer to as reachable.
++  bool HasGeneratedAppearance() const;
++  // /AP and pdfium::annotation::kPDFiumHasGeneratedAP.
++  static bool IsGeneratedAppearanceEntry(ByteStringView key);
++
+   // Creates a new object owned by the dictionary and returns an unowned
+   // pointer to it. Invalidates iterators for the element with the key |key|.
+   // Prefer using these templates over calls to SetFor(), since by creating
+diff --git a/core/fpdfapi/parser/object_tree_traversal_util.cpp b/core/fpdfapi/parser/object_tree_traversal_util.cpp
+index eebcff1..ae30958 100644
+--- a/core/fpdfapi/parser/object_tree_traversal_util.cpp
++++ b/core/fpdfapi/parser/object_tree_traversal_util.cpp
+@@ -25,8 +25,13 @@ namespace {
+ 
+ class ObjectTreeTraverser {
+  public:
+-  explicit ObjectTreeTraverser(const CPDF_Document* document)
+-      : document_(document) {
++  // With `skip_generated_appearances`, the appearance of an annotation
++  // dictionary that PDFium generated only to draw it is not followed: it is
++  // not written when the document is saved (CPDF_Dictionary::WriteTo()).
++  ObjectTreeTraverser(const CPDF_Document* document,
++                      bool skip_generated_appearances)
++      : document_(document),
++        skip_generated_appearances_(skip_generated_appearances) {
+     const CPDF_Parser* parser = document_->GetParser();
+     const CPDF_Dictionary* trailer = parser ? parser->GetTrailer() : nullptr;
+     const CPDF_Dictionary* root = trailer ? trailer : document_->GetRoot();
+@@ -71,8 +76,16 @@ class ObjectTreeTraverser {
+           break;
+         }
+         case CPDF_Object::kDictionary: {
+-          CPDF_DictionaryLocker locker(current_object->AsDictionary());
++          const CPDF_Dictionary* dict = current_object->AsDictionary();
++          const bool skip_generated_appearance =
++              skip_generated_appearances_ && dict->HasGeneratedAppearance();
++          CPDF_DictionaryLocker locker(dict);
+           for (const auto& it : locker) {
++            if (skip_generated_appearance &&
++                CPDF_Dictionary::IsGeneratedAppearanceEntry(
++                    it.first.AsStringView())) {
++              continue;
++            }
+             PushNewObject(current_object, it.second);
+           }
+           break;
+@@ -171,6 +184,7 @@ class ObjectTreeTraverser {
+   }
+ 
+   UnownedPtr<const CPDF_Document> const document_;
++  const bool skip_generated_appearances_;
+ 
+   // Queue of objects to traverse.
+   // - Pointers in the queue are non-null.
+@@ -197,7 +211,7 @@ class ObjectTreeTraverser {
+ }  // namespace
+ 
+ std::set<uint32_t> GetObjectsWithReferences(const CPDF_Document* document) {
+-  ObjectTreeTraverser traverser(document);
++  ObjectTreeTraverser traverser(document, /*skip_generated_appearances=*/true);
+   traverser.Traverse();
+ 
+   std::set<uint32_t> results;
+@@ -209,7 +223,8 @@ std::set<uint32_t> GetObjectsWithReferences(const CPDF_Document* document) {
+ 
+ std::set<uint32_t> GetObjectsWithMultipleReferences(
+     const CPDF_Document* document) {
+-  ObjectTreeTraverser traverser(document);
++  ObjectTreeTraverser traverser(document,
++                                /*skip_generated_appearances=*/false);
+   traverser.Traverse();
+ 
+   std::set<uint32_t> results;
+diff --git a/core/fpdfapi/parser/object_tree_traversal_util.h b/core/fpdfapi/parser/object_tree_traversal_util.h
+index e9db96d..88f5087 100644
+--- a/core/fpdfapi/parser/object_tree_traversal_util.h
++++ b/core/fpdfapi/parser/object_tree_traversal_util.h
+@@ -15,11 +15,15 @@ class CPDF_Document;
+ // the catalog, which always exists. The trailer should have a reference to the
+ // catalog. The traversal avoids cycles.
+ // Returns all the PDF objects (not CPDF_Objects) the traversal reached as a set
+-// of object numbers.
++// of object numbers. The appearance of an annotation dictionary that PDFium
++// generated only to draw it (CPDF_Dictionary::HasGeneratedAppearance()) is not
++// followed, since saving the document does not write it.
+ std::set<uint32_t> GetObjectsWithReferences(const CPDF_Document* document);
+ 
+ // Same as GetObjectsWithReferences(), but only returns the objects with
+ // multiple references. References that would create a cycle are ignored.
++// Generated appearances are followed (they use their objects while the
++// document is open).
+ //
+ // In this example, where (A) is the root node:
+ //
+diff --git a/core/fpdfdoc/cpdf_annot.cpp b/core/fpdfdoc/cpdf_annot.cpp
+index 13a9680..2561040 100644
+--- a/core/fpdfdoc/cpdf_annot.cpp
++++ b/core/fpdfdoc/cpdf_annot.cpp
+@@ -34,8 +34,6 @@
+ 
+ namespace {
+ 
+-const char kPDFiumKey_HasGeneratedAP[] = "PDFIUM_HasGeneratedAP";
+-
+ bool IsTextMarkupAnnotation(CPDF_Annot::Subtype type) {
+   return type == CPDF_Annot::Subtype::HIGHLIGHT ||
+          type == CPDF_Annot::Subtype::SQUIGGLY ||
+@@ -132,8 +130,7 @@ CPDF_Annot::CPDF_Annot(RetainPtr<CPDF_Dictionary> dict, CPDF_Document* document)
+       subtype_(StringToAnnotSubtype(
+           annot_dict_->GetByteStringFor(pdfium::annotation::kSubtype))),
+       is_text_markup_annotation_(IsTextMarkupAnnotation(subtype_)),
+-      has_generated_ap_(
+-          annot_dict_->GetBooleanFor(kPDFiumKey_HasGeneratedAP, false)) {
++      has_generated_ap_(annot_dict_->HasGeneratedAppearance()) {
+   // A Popup annotation is only ever the one CPDF_AnnotList creates for a
+   // markup annotation with /Contents (popups from the file are skipped). It is
+   // drawn only while it is open (ShouldDrawAnnotation()), and DrawAppearance()
+@@ -159,7 +156,10 @@ void CPDF_Annot::GenerateAPIfNeeded() {
+     return;
+   }
+ 
+-  annot_dict_->SetNewFor<CPDF_Boolean>(kPDFiumKey_HasGeneratedAP, true);
++  // Marks the appearance as a rendering cache: a save does not write it (nor
++  // the mark), so the saved annotation does not depend on what was drawn.
++  annot_dict_->SetNewFor<CPDF_Boolean>(
++      pdfium::annotation::kPDFiumHasGeneratedAP, true);
+   has_generated_ap_ = true;
+ }
+ 
+diff --git a/fpdfsdk/fpdf_annot.cpp b/fpdfsdk/fpdf_annot.cpp
+index fb5c862..238afdb 100644
+--- a/fpdfsdk/fpdf_annot.cpp
++++ b/fpdfsdk/fpdf_annot.cpp
+@@ -557,6 +557,8 @@ FPDFAnnot_UpdateObject(FPDF_ANNOTATION annot, FPDF_PAGEOBJECT obj) {
+ 
+   // Update the content stream data in the annotation's AP stream.
+   UpdateContentStream(pForm, pStream.Get());
++  // The caller changed the appearance: it is no longer one PDFium generated.
++  pAnnotDict->RemoveFor(pdfium::annotation::kPDFiumHasGeneratedAP);
+   return true;
+ }
+ 
+@@ -647,6 +649,8 @@ FPDFAnnot_AppendObject(FPDF_ANNOTATION annot, FPDF_PAGEOBJECT obj) {
+ 
+   // Set the content stream data in the annotation's AP stream.
+   UpdateContentStream(pForm, pStream.Get());
++  // The caller changed the appearance: it is no longer one PDFium generated.
++  pAnnotDict->RemoveFor(pdfium::annotation::kPDFiumHasGeneratedAP);
+   return true;
+ }
+ 
+@@ -717,6 +721,8 @@ FPDFAnnot_RemoveObject(FPDF_ANNOTATION annot, int index) {
+   }
+ 
+   UpdateContentStream(pAnnot->GetForm(), pStream.Get());
++  // The caller changed the appearance: it is no longer one PDFium generated.
++  pAnnotDict->RemoveFor(pdfium::annotation::kPDFiumHasGeneratedAP);
+   return true;
+ }
+ 
+@@ -1181,6 +1187,8 @@ FPDFAnnot_SetAP(FPDF_ANNOTATION annot,
+     if (ap_dict) {
+       if (appearanceMode == FPDF_ANNOT_APPEARANCEMODE_NORMAL) {
+         pAnnotDict->RemoveFor(pdfium::annotation::kAP);
++        // No appearance left that PDFium generated.
++        pAnnotDict->RemoveFor(pdfium::annotation::kPDFiumHasGeneratedAP);
+       } else {
+         ap_dict->RemoveFor(mode_key);
+       }
+@@ -1228,6 +1236,11 @@ FPDFAnnot_SetAP(FPDF_ANNOTATION annot,
+     ap_dict = pAnnotDict->SetNewFor<CPDF_Dictionary>(pdfium::annotation::kAP);
+   }
+   ap_dict->SetNewFor<CPDF_Reference>(mode_key, doc, new_stream->GetObjNum());
++  // The normal appearance is the caller's now, not one PDFium generated: it is
++  // written when the document is saved.
++  if (appearanceMode == FPDF_ANNOT_APPEARANCEMODE_NORMAL) {
++    pAnnotDict->RemoveFor(pdfium::annotation::kPDFiumHasGeneratedAP);
++  }
+ 
+   return true;
+ }
+@@ -1257,6 +1270,52 @@ FPDFAnnot_GetAP(FPDF_ANNOTATION annot,
+       UNSAFE_BUFFERS(SpanFromFPDFApiArgs(buffer, buflen)));
+ }
+ 
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_GenerateAP(FPDF_ANNOTATION annot) {
++  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
++  if (!context) {
++    return false;
++  }
++
++  CPDF_Document* doc = context->GetPage()->GetDocument();
++  if (!doc) {
++    return false;
++  }
++
++  RetainPtr<CPDF_Dictionary> annot_dict = context->GetMutableAnnotDict();
++  const CPDF_Annot::Subtype subtype = CPDF_Annot::StringToAnnotSubtype(
++      annot_dict->GetNameFor(pdfium::annotation::kSubtype));
++  if (!CPDF_GenerateAP::GenerateAnnotAP(doc, annot_dict.Get(), subtype)) {
++    return false;
++  }
++
++  // Unlike an appearance generated to draw the annotation, this one is the
++  // annotation's own: it is written when the document is saved.
++  annot_dict->RemoveFor(pdfium::annotation::kPDFiumHasGeneratedAP);
++  if (context->HasForm()) {
++    context->SetForm(
++        GetAnnotAP(annot_dict.Get(), CPDF_Annot::AppearanceMode::kNormal));
++  }
++  return true;
++}
++
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_MarkGeneratedAP(FPDF_ANNOTATION annot, FPDF_BOOL generated) {
++  RetainPtr<CPDF_Dictionary> annot_dict =
++      GetMutableAnnotDictFromFPDFAnnotation(annot);
++  if (!annot_dict) {
++    return false;
++  }
++
++  if (generated) {
++    annot_dict->SetNewFor<CPDF_Boolean>(
++        pdfium::annotation::kPDFiumHasGeneratedAP, true);
++  } else {
++    annot_dict->RemoveFor(pdfium::annotation::kPDFiumHasGeneratedAP);
++  }
++  return true;
++}
++
+ FPDF_EXPORT FPDF_ANNOTATION FPDF_CALLCONV
+ FPDFAnnot_GetLinkedAnnot(FPDF_ANNOTATION annot, FPDF_BYTESTRING key) {
+   CPDF_AnnotContext* pAnnot = CPDFAnnotContextFromFPDFAnnotation(annot);
+diff --git a/fpdfsdk/fpdf_annot_embeddertest.cpp b/fpdfsdk/fpdf_annot_embeddertest.cpp
+index 059285d..2b79f30 100644
+--- a/fpdfsdk/fpdf_annot_embeddertest.cpp
++++ b/fpdfsdk/fpdf_annot_embeddertest.cpp
+@@ -478,6 +478,204 @@ TEST_F(FPDFAnnotEmbedderTest, RenderMultilineMarkupAnnotWithoutAP) {
+                                      "annotation_markup_multiline_no_ap");
+ }
+ 
++namespace {
++
++bool SavedContains(const std::string& saved, const char* text) {
++  return saved.find(text) != std::string::npos;
++}
++
++bool HasGeneratedAPMark(FPDF_ANNOTATION annot) {
++  return FPDFAnnot_HasKey(annot, pdfium::annotation::kPDFiumHasGeneratedAP);
++}
++
++}  // namespace
++
++TEST_F(FPDFAnnotEmbedderTest, SaveOmitsGeneratedAppearances) {
++  // Four text markup annotations without an appearance stream.
++  ASSERT_TRUE(OpenDocument("annotation_markup_multiline_no_ap.pdf"));
++  ScopedPage page = LoadScopedPage(0);
++  ASSERT_TRUE(page);
++
++  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
++  const std::string saved_before_render = GetString();
++  ClearString();
++  EXPECT_FALSE(SavedContains(saved_before_render, "/AP"));
++
++  // Drawing the annotations generates an appearance for each of them.
++  RenderLoadedPageWithFlags(page.get(), FPDF_ANNOT);
++  ASSERT_EQ(4, FPDFPage_GetAnnotCount(page.get()));
++  for (int i = 0; i < 4; ++i) {
++    ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), i));
++    ASSERT_TRUE(annot);
++    EXPECT_TRUE(FPDFAnnot_HasKey(annot.get(), pdfium::annotation::kAP));
++    EXPECT_TRUE(HasGeneratedAPMark(annot.get()));
++  }
++
++  // A save writes neither the generated appearances (nor the objects only they
++  // refer to) nor their mark, so it does not depend on what was drawn.
++  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
++  const std::string saved_after_render = GetString();
++  EXPECT_FALSE(SavedContains(saved_after_render, "/AP"));
++  EXPECT_FALSE(SavedContains(saved_after_render, "/XObject"));
++  EXPECT_FALSE(SavedContains(saved_after_render,
++                             pdfium::annotation::kPDFiumHasGeneratedAP));
++  // Only the trailer's /Size may differ (the skipped new object numbers).
++  EXPECT_LE(saved_after_render.size(), saved_before_render.size() + 4);
++  EXPECT_GE(saved_after_render.size(), saved_before_render.size());
++
++  // The in-memory appearances are untouched.
++  {
++    ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), 0));
++    ASSERT_TRUE(annot);
++    EXPECT_TRUE(FPDFAnnot_HasKey(annot.get(), pdfium::annotation::kAP));
++    EXPECT_TRUE(HasGeneratedAPMark(annot.get()));
++  }
++
++  // The saved document draws the same: PDFium generates the appearances again.
++  ScopedSavedDoc saved_doc = OpenScopedSavedDocument();
++  ASSERT_TRUE(saved_doc);
++  ScopedSavedPage saved_page = LoadScopedSavedPage(0);
++  ASSERT_TRUE(saved_page);
++  VerifySavedRenderingWithExpectationSuffix(
++      saved_page.get(), "annotation_markup_multiline_no_ap");
++}
++
++TEST_F(FPDFAnnotEmbedderTest, GenerateAPIsSaved) {
++  EXPECT_FALSE(FPDFAnnot_GenerateAP(nullptr));
++
++  ASSERT_TRUE(OpenDocument("annotation_markup_multiline_no_ap.pdf"));
++  ScopedPage page = LoadScopedPage(0);
++  ASSERT_TRUE(page);
++
++  {
++    ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), 0));
++    ASSERT_TRUE(annot);
++    ASSERT_TRUE(FPDFAnnot_GenerateAP(annot.get()));
++    EXPECT_TRUE(FPDFAnnot_HasKey(annot.get(), pdfium::annotation::kAP));
++    EXPECT_FALSE(HasGeneratedAPMark(annot.get()));
++  }
++
++  // Drawing keeps that appearance and generates the other three.
++  RenderLoadedPageWithFlags(page.get(), FPDF_ANNOT);
++  for (int i = 0; i < 4; ++i) {
++    ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), i));
++    ASSERT_TRUE(annot);
++    EXPECT_TRUE(FPDFAnnot_HasKey(annot.get(), pdfium::annotation::kAP));
++    EXPECT_EQ(i != 0, HasGeneratedAPMark(annot.get()));
++  }
++
++  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
++  EXPECT_FALSE(
++      SavedContains(GetString(), pdfium::annotation::kPDFiumHasGeneratedAP));
++
++  // Only the first annotation has an appearance in the saved document.
++  ScopedSavedDoc saved_doc = OpenScopedSavedDocument();
++  ASSERT_TRUE(saved_doc);
++  ScopedSavedPage saved_page = LoadScopedSavedPage(0);
++  ASSERT_TRUE(saved_page);
++  ASSERT_EQ(4, FPDFPage_GetAnnotCount(saved_page.get()));
++  for (int i = 0; i < 4; ++i) {
++    ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(saved_page.get(), i));
++    ASSERT_TRUE(annot);
++    EXPECT_EQ(i == 0, FPDFAnnot_HasKey(annot.get(), pdfium::annotation::kAP));
++    EXPECT_FALSE(HasGeneratedAPMark(annot.get()));
++  }
++  VerifySavedRenderingWithExpectationSuffix(
++      saved_page.get(), "annotation_markup_multiline_no_ap");
++}
++
++TEST_F(FPDFAnnotEmbedderTest, MarkGeneratedAPAndSetAP) {
++  EXPECT_FALSE(FPDFAnnot_MarkGeneratedAP(nullptr, true));
++  EXPECT_FALSE(FPDFAnnot_MarkGeneratedAP(nullptr, false));
++
++  ASSERT_TRUE(OpenDocument("annotation_markup_multiline_no_ap.pdf"));
++  ScopedPage page = LoadScopedPage(0);
++  ASSERT_TRUE(page);
++  RenderLoadedPageWithFlags(page.get(), FPDF_ANNOT);
++
++  {
++    // A generated appearance adopted as the annotation's own.
++    ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), 0));
++    ASSERT_TRUE(annot);
++    ASSERT_TRUE(HasGeneratedAPMark(annot.get()));
++    ASSERT_TRUE(FPDFAnnot_MarkGeneratedAP(annot.get(), false));
++    EXPECT_FALSE(HasGeneratedAPMark(annot.get()));
++    EXPECT_TRUE(FPDFAnnot_HasKey(annot.get(), pdfium::annotation::kAP));
++  }
++  {
++    // An appearance set by the caller replaces the generated one.
++    ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), 1));
++    ASSERT_TRUE(annot);
++    ASSERT_TRUE(HasGeneratedAPMark(annot.get()));
++    ScopedFPDFWideString ap =
++        GetFPDFWideString(L"0 0 1 rg 108 552 398 38 re f");
++    ASSERT_TRUE(FPDFAnnot_SetAP(annot.get(), FPDF_ANNOT_APPEARANCEMODE_NORMAL,
++                                ap.get()));
++    EXPECT_FALSE(HasGeneratedAPMark(annot.get()));
++  }
++  {
++    // An appearance marked as generated after all.
++    ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), 3));
++    ASSERT_TRUE(annot);
++    ASSERT_TRUE(FPDFAnnot_MarkGeneratedAP(annot.get(), false));
++    ASSERT_TRUE(FPDFAnnot_MarkGeneratedAP(annot.get(), true));
++    EXPECT_TRUE(HasGeneratedAPMark(annot.get()));
++  }
++  // Annotation 2 keeps its generated appearance.
++
++  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
++  EXPECT_FALSE(
++      SavedContains(GetString(), pdfium::annotation::kPDFiumHasGeneratedAP));
++
++  ScopedSavedDoc saved_doc = OpenScopedSavedDocument();
++  ASSERT_TRUE(saved_doc);
++  ScopedSavedPage saved_page = LoadScopedSavedPage(0);
++  ASSERT_TRUE(saved_page);
++  ASSERT_EQ(4, FPDFPage_GetAnnotCount(saved_page.get()));
++  for (int i = 0; i < 4; ++i) {
++    ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(saved_page.get(), i));
++    ASSERT_TRUE(annot);
++    EXPECT_EQ(i <= 1, FPDFAnnot_HasKey(annot.get(), pdfium::annotation::kAP));
++  }
++}
++
++TEST_F(FPDFAnnotEmbedderTest, SaveOmitsGeneratedAppearanceOfNewAnnotation) {
++  ASSERT_TRUE(OpenDocument("hello_world.pdf"));
++  ScopedPage page = LoadScopedPage(0);
++  ASSERT_TRUE(page);
++
++  {
++    // A new annotation's dictionary is direct in /Annots.
++    ScopedFPDFAnnotation annot(
++        FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_SQUARE));
++    ASSERT_TRUE(annot);
++    const FS_RECTF rect = {20.0f, 40.0f, 90.0f, 70.0f};
++    ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
++    ASSERT_TRUE(FPDFAnnot_SetColor(annot.get(), FPDFANNOT_COLORTYPE_Color, 0,
++                                   0, 255, 255));
++    ScopedFPDFWideString ap = GetFPDFWideString(L"0 0 1 RG 21 41 68 28 re S");
++    ASSERT_TRUE(FPDFAnnot_SetAP(annot.get(), FPDF_ANNOT_APPEARANCEMODE_NORMAL,
++                                ap.get()));
++    ASSERT_TRUE(FPDFAnnot_MarkGeneratedAP(annot.get(), true));
++  }
++  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
++  EXPECT_FALSE(SavedContains(GetString(), "/AP"));
++  EXPECT_FALSE(
++      SavedContains(GetString(), pdfium::annotation::kPDFiumHasGeneratedAP));
++  EXPECT_TRUE(SavedContains(GetString(), "/Square"));
++  ClearString();
++
++  {
++    ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), 0));
++    ASSERT_TRUE(annot);
++    ASSERT_TRUE(FPDFAnnot_GenerateAP(annot.get()));
++  }
++  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
++  EXPECT_TRUE(SavedContains(GetString(), "/AP"));
++  EXPECT_FALSE(
++      SavedContains(GetString(), pdfium::annotation::kPDFiumHasGeneratedAP));
++}
++
+ TEST_F(FPDFAnnotEmbedderTest, ExtractHighlightLongContent) {
+   // Open a file with one annotation and load its first page.
+   ASSERT_TRUE(OpenDocument("annotation_highlight_long_content.pdf"));
+diff --git a/fpdfsdk/fpdf_view_c_api_test.c b/fpdfsdk/fpdf_view_c_api_test.c
+index fee4f4a..24fe23c 100644
+--- a/fpdfsdk/fpdf_view_c_api_test.c
++++ b/fpdfsdk/fpdf_view_c_api_test.c
+@@ -45,6 +45,7 @@ int CheckPDFiumCApi() {
+     CHK(FPDFAnnot_AppendAttachmentPoints);
+     CHK(FPDFAnnot_AppendObject);
+     CHK(FPDFAnnot_CountAttachmentPoints);
++    CHK(FPDFAnnot_GenerateAP);
+     CHK(FPDFAnnot_GetAP);
+     CHK(FPDFAnnot_GetAttachmentPoints);
+     CHK(FPDFAnnot_GetBorder);
+@@ -86,6 +87,7 @@ int CheckPDFiumCApi() {
+     CHK(FPDFAnnot_IsObjectSupportedSubtype);
+     CHK(FPDFAnnot_IsOptionSelected);
+     CHK(FPDFAnnot_IsSupportedSubtype);
++    CHK(FPDFAnnot_MarkGeneratedAP);
+     CHK(FPDFAnnot_RemoveInkList);
+     CHK(FPDFAnnot_RemoveObject);
+     CHK(FPDFAnnot_SetAP);
+diff --git a/public/fpdf_annot.h b/public/fpdf_annot.h
+index b452cfa..5e75255 100644
+--- a/public/fpdf_annot.h
++++ b/public/fpdf_annot.h
+@@ -639,6 +639,38 @@ FPDFAnnot_GetAP(FPDF_ANNOTATION annot,
+                 FPDF_WCHAR* buffer,
+                 unsigned long buflen);
+ 
++// Experimental API.
++// Generate the normal appearance stream of |annot| from its dictionary, the
++// way PDFium generates one to draw an annotation that has none, and make it
++// the annotation's own appearance. An appearance PDFium generates only to draw
++// an annotation is not written when the document is saved; this one is. An
++// existing normal appearance is replaced.
++// Only the subtypes PDFium can generate an appearance for are supported:
++// circle, free text, highlight, ink, popup, square, squiggly, strikeout, text
++// and underline.
++//
++//   annot - handle to an annotation.
++//
++// Returns true if successful.
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_GenerateAP(FPDF_ANNOTATION annot);
++
++// Experimental API.
++// Set whether the normal appearance of |annot| counts as one PDFium generated
++// only to draw it. Such an appearance - like the one PDFium generates when it
++// draws an annotation that has none - is not written when the document is
++// saved, and neither is the entry that marks it.
++// FPDFAnnot_SetAP() for the normal mode and the FPDFAnnot_*Object() functions
++// that change the normal appearance make it the annotation's own.
++//
++//   annot     - handle to an annotation.
++//   generated - true: not written when the document is saved; false: the
++//               annotation's own appearance, written when the document is
++//               saved.
++//
++// Returns true if successful.
++FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
++FPDFAnnot_MarkGeneratedAP(FPDF_ANNOTATION annot, FPDF_BOOL generated);
++
+ // Experimental API.
+ // Get the annotation corresponding to |key| in |annot|'s dictionary. Common
+ // keys for linking annotations include "IRT" and "Popup". Must call

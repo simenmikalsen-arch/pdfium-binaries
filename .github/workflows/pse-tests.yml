@@ -2,7 +2,7 @@ name: PSE patch tests
 
 # Patched build for PDF Studio Elite (patches/pse/README.md).
 # Builds PDFium's own unit and embedder tests on Linux, runs them without and
-# with patches/pse/0001-0003, and fails if the patches introduce a test failure
+# with patches/pse/0001-0004, and fails if the patches introduce a test failure
 # (or if one of their new or changed tests does not pass).
 
 on:
@@ -70,6 +70,7 @@ jobs:
           patch --verbose -p1 -d pdfium -i "$PWD/patches/pse/0001-generatecontent-perf.patch"
           patch --verbose -p1 -d pdfium -i "$PWD/patches/pse/0002-popup-lazy-appearance.patch"
           patch --verbose -p1 -d pdfium -i "$PWD/patches/pse/0003-save-reachable-objects.patch"
+          patch --verbose -p1 -d pdfium -i "$PWD/patches/pse/0004-save-omits-generated-appearances.patch"
         shell: bash
       - name: Build tests (patched)
         run: ninja -C pdfium/out/Release pdfium_unittests pdfium_embeddertests
@@ -81,7 +82,7 @@ jobs:
         shell: bash
         run: |
           pdfium/out/Release/pdfium_unittests --gtest_filter='CPDFAnnotListTest.*' > patched-annotlist.log 2>&1 || true
-          grep -h -E '^\[( +OK|  FAILED  ) \] (FPDFAnnotEmbedderTest.RenderAddsNoPopupObjectsToDocument|FPDFAnnotEmbedderTest.Bug1206|FPDFSaveEmbedderTest.SaveSkipsUnreferencedNewObjects|FPDFSaveEmbedderTest.SaveNewDocSkipsUnreferencedNewObjects|FPDFSaveEmbedderTest.SaveImportedPagesSkipsReplacedAppearances|CPDFSecurityHandlerEmbedderTest.SaveWithUnreferencedNewObjectVersion3)' patched-embeddertests-*.log > patched-pse-embedder.log || true
+          grep -h -E '^\[( +OK|  FAILED  ) \] (FPDFAnnotEmbedderTest.RenderAddsNoPopupObjectsToDocument|FPDFAnnotEmbedderTest.Bug1206|FPDFSaveEmbedderTest.SaveSkipsUnreferencedNewObjects|FPDFSaveEmbedderTest.SaveNewDocSkipsUnreferencedNewObjects|FPDFSaveEmbedderTest.SaveImportedPagesSkipsReplacedAppearances|CPDFSecurityHandlerEmbedderTest.SaveWithUnreferencedNewObjectVersion3|FPDFAnnotEmbedderTest.SaveOmitsGeneratedAppearances|FPDFAnnotEmbedderTest.GenerateAPIsSaved|FPDFAnnotEmbedderTest.MarkGeneratedAPAndSetAP|FPDFAnnotEmbedderTest.SaveOmitsGeneratedAppearanceOfNewAnnotation)' patched-embeddertests-*.log > patched-pse-embedder.log || true
           echo "Failures without the patch:"; cat unpatched-failures.txt
           echo "Failures with the patch:"; cat patched-failures.txt
           comm -13 unpatched-failures.txt patched-failures.txt > new-failures.txt
@@ -104,7 +105,11 @@ jobs:
                    FPDFSaveEmbedderTest.SaveSkipsUnreferencedNewObjects \
                    FPDFSaveEmbedderTest.SaveNewDocSkipsUnreferencedNewObjects \
                    FPDFSaveEmbedderTest.SaveImportedPagesSkipsReplacedAppearances \
-                   CPDFSecurityHandlerEmbedderTest.SaveWithUnreferencedNewObjectVersion3; do
+                   CPDFSecurityHandlerEmbedderTest.SaveWithUnreferencedNewObjectVersion3 \
+                   FPDFAnnotEmbedderTest.SaveOmitsGeneratedAppearances \
+                   FPDFAnnotEmbedderTest.GenerateAPIsSaved \
+                   FPDFAnnotEmbedderTest.MarkGeneratedAPAndSetAP \
+                   FPDFAnnotEmbedderTest.SaveOmitsGeneratedAppearanceOfNewAnnotation; do
             grep -q "^\[       OK \] $t " patched-pse-embedder.log || { echo "missing or failed: $t"; exit 1; }
           done
           [ ! -s new-failures.txt ]
