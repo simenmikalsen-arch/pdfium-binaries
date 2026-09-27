@@ -415,10 +415,10 @@ index 6b92890..a29df1c 100644
  }
  
 diff --git a/fpdfsdk/fpdf_annot.cpp b/fpdfsdk/fpdf_annot.cpp
-index fb5c862..6db29c0 100644
+index fb5c862..a460f2c 100644
 --- a/fpdfsdk/fpdf_annot.cpp
 +++ b/fpdfsdk/fpdf_annot.cpp
-@@ -187,6 +187,25 @@ bool HasAPStream(CPDF_Dictionary* pAnnotDict) {
+@@ -187,6 +187,46 @@ bool HasAPStream(CPDF_Dictionary* pAnnotDict) {
    return !!GetAnnotAP(pAnnotDict, CPDF_Annot::AppearanceMode::kNormal);
  }
  
@@ -427,6 +427,27 @@ index fb5c862..6db29c0 100644
 +void AdoptAppearance(CPDF_Dictionary* annot_dict) {
 +  annot_dict->RemoveFor(pdfium::annotation::kPDFiumHasGeneratedAP);
 +  annot_dict->RemoveFor(pdfium::annotation::kPDFiumRectBeforeGeneratedAP);
++}
++
++// PDFium draws a text markup annotation whose appearance it generated into the
++// bounds of its quad points (CPDF_Annot::RectForDrawing()), and any appearance
++// of its own into /Rect. For an appearance generated from the quad points that
++// becomes the annotation's own, /Rect is set to the appearance's bounding box,
++// so it is drawn the same, here and in other viewers.
++void MatchRectToTextMarkupAppearance(CPDF_Dictionary* annot_dict) {
++  const CPDF_Annot::Subtype subtype = CPDF_Annot::StringToAnnotSubtype(
++      annot_dict->GetNameFor(pdfium::annotation::kSubtype));
++  if (subtype != CPDF_Annot::Subtype::HIGHLIGHT &&
++      subtype != CPDF_Annot::Subtype::SQUIGGLY &&
++      subtype != CPDF_Annot::Subtype::STRIKEOUT &&
++      subtype != CPDF_Annot::Subtype::UNDERLINE) {
++    return;
++  }
++  if (!GetQuadPointsArrayFromDictionary(annot_dict)) {
++    return;
++  }
++  annot_dict->SetRectFor(pdfium::annotation::kRect,
++                         CPDF_Annot::BoundingRectFromQuadPoints(annot_dict));
 +}
 +
 +// The normal appearance is being removed: if PDFium generated it to draw the
@@ -444,7 +465,7 @@ index fb5c862..6db29c0 100644
  void UpdateContentStream(CPDF_Form* pForm, CPDF_Stream* pStream) {
    DCHECK(pForm);
    DCHECK(pStream);
-@@ -557,6 +576,8 @@ FPDFAnnot_UpdateObject(FPDF_ANNOTATION annot, FPDF_PAGEOBJECT obj) {
+@@ -557,6 +597,8 @@ FPDFAnnot_UpdateObject(FPDF_ANNOTATION annot, FPDF_PAGEOBJECT obj) {
  
    // Update the content stream data in the annotation's AP stream.
    UpdateContentStream(pForm, pStream.Get());
@@ -453,7 +474,7 @@ index fb5c862..6db29c0 100644
    return true;
  }
  
-@@ -647,6 +668,8 @@ FPDFAnnot_AppendObject(FPDF_ANNOTATION annot, FPDF_PAGEOBJECT obj) {
+@@ -647,6 +689,8 @@ FPDFAnnot_AppendObject(FPDF_ANNOTATION annot, FPDF_PAGEOBJECT obj) {
  
    // Set the content stream data in the annotation's AP stream.
    UpdateContentStream(pForm, pStream.Get());
@@ -462,7 +483,7 @@ index fb5c862..6db29c0 100644
    return true;
  }
  
-@@ -717,6 +740,8 @@ FPDFAnnot_RemoveObject(FPDF_ANNOTATION annot, int index) {
+@@ -717,6 +761,8 @@ FPDFAnnot_RemoveObject(FPDF_ANNOTATION annot, int index) {
    }
  
    UpdateContentStream(pAnnot->GetForm(), pStream.Get());
@@ -471,7 +492,7 @@ index fb5c862..6db29c0 100644
    return true;
  }
  
-@@ -920,6 +945,8 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetRect(FPDF_ANNOTATION annot,
+@@ -920,6 +966,8 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetRect(FPDF_ANNOTATION annot,
  
    // Update the "Rect" entry in the annotation dictionary.
    pAnnotDict->SetRectFor(pdfium::annotation::kRect, newRect);
@@ -480,7 +501,7 @@ index fb5c862..6db29c0 100644
    return true;
  }
  
-@@ -1046,6 +1073,7 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetBorder(FPDF_ANNOTATION annot,
+@@ -1046,6 +1094,7 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFAnnot_SetBorder(FPDF_ANNOTATION annot,
  
    // Remove the appearance stream. Otherwise PDF viewers will render that and
    // not use the border values.
@@ -488,7 +509,7 @@ index fb5c862..6db29c0 100644
    annot_dict->RemoveFor(pdfium::annotation::kAP);
  
    auto border = annot_dict->SetNewFor<CPDF_Array>(pdfium::annotation::kBorder);
-@@ -1178,6 +1206,9 @@ FPDFAnnot_SetAP(FPDF_ANNOTATION annot,
+@@ -1178,6 +1227,9 @@ FPDFAnnot_SetAP(FPDF_ANNOTATION annot,
  
    // If `value` is null, then the action is to remove.
    if (!value) {
@@ -498,7 +519,7 @@ index fb5c862..6db29c0 100644
      if (ap_dict) {
        if (appearanceMode == FPDF_ANNOT_APPEARANCEMODE_NORMAL) {
          pAnnotDict->RemoveFor(pdfium::annotation::kAP);
-@@ -1228,6 +1259,11 @@ FPDFAnnot_SetAP(FPDF_ANNOTATION annot,
+@@ -1228,6 +1280,11 @@ FPDFAnnot_SetAP(FPDF_ANNOTATION annot,
      ap_dict = pAnnotDict->SetNewFor<CPDF_Dictionary>(pdfium::annotation::kAP);
    }
    ap_dict->SetNewFor<CPDF_Reference>(mode_key, doc, new_stream->GetObjNum());
@@ -510,7 +531,7 @@ index fb5c862..6db29c0 100644
  
    return true;
  }
-@@ -1257,6 +1293,58 @@ FPDFAnnot_GetAP(FPDF_ANNOTATION annot,
+@@ -1257,6 +1314,60 @@ FPDFAnnot_GetAP(FPDF_ANNOTATION annot,
        UNSAFE_BUFFERS(SpanFromFPDFApiArgs(buffer, buflen)));
  }
  
@@ -542,6 +563,7 @@ index fb5c862..6db29c0 100644
 +  // Unlike an appearance generated to draw the annotation, this one is the
 +  // annotation's own: it is written when the document is saved.
 +  AdoptAppearance(annot_dict.Get());
++  MatchRectToTextMarkupAppearance(annot_dict.Get());
 +  if (context->HasForm()) {
 +    context->SetForm(
 +        GetAnnotAP(annot_dict.Get(), CPDF_Annot::AppearanceMode::kNormal));
@@ -560,8 +582,9 @@ index fb5c862..6db29c0 100644
 +  if (generated) {
 +    annot_dict->SetNewFor<CPDF_Boolean>(
 +        pdfium::annotation::kPDFiumHasGeneratedAP, true);
-+  } else {
++  } else if (annot_dict->HasGeneratedAppearance()) {
 +    AdoptAppearance(annot_dict.Get());
++    MatchRectToTextMarkupAppearance(annot_dict.Get());
 +  }
 +  return true;
 +}
@@ -569,7 +592,7 @@ index fb5c862..6db29c0 100644
  FPDF_EXPORT FPDF_ANNOTATION FPDF_CALLCONV
  FPDFAnnot_GetLinkedAnnot(FPDF_ANNOTATION annot, FPDF_BYTESTRING key) {
    CPDF_AnnotContext* pAnnot = CPDFAnnotContextFromFPDFAnnotation(annot);
-@@ -1525,6 +1613,7 @@ FPDFAnnot_SetFontColor(FPDF_FORMHANDLE handle,
+@@ -1525,6 +1636,7 @@ FPDFAnnot_SetFontColor(FPDF_FORMHANDLE handle,
    //
    // TODO(thestig) When GenerateDefaultAppearanceWithColor() properly updates
    // the annotation's appearance stream, remove this.
@@ -1025,10 +1048,10 @@ index fee4f4a..24fe23c 100644
      CHK(FPDFAnnot_RemoveObject);
      CHK(FPDFAnnot_SetAP);
 diff --git a/public/fpdf_annot.h b/public/fpdf_annot.h
-index b452cfa..5e75255 100644
+index b452cfa..2571a5d 100644
 --- a/public/fpdf_annot.h
 +++ b/public/fpdf_annot.h
-@@ -639,6 +639,38 @@ FPDFAnnot_GetAP(FPDF_ANNOTATION annot,
+@@ -639,6 +639,41 @@ FPDFAnnot_GetAP(FPDF_ANNOTATION annot,
                  FPDF_WCHAR* buffer,
                  unsigned long buflen);
  
@@ -1037,7 +1060,8 @@ index b452cfa..5e75255 100644
 +// way PDFium generates one to draw an annotation that has none, and make it
 +// the annotation's own appearance. An appearance PDFium generates only to draw
 +// an annotation is not written when the document is saved; this one is. An
-+// existing normal appearance is replaced.
++// existing normal appearance is replaced. For a text markup annotation, /Rect
++// is set to the bounds of its quad points (the appearance's bounding box).
 +// Only the subtypes PDFium can generate an appearance for are supported:
 +// circle, free text, highlight, ink, popup, square, squiggly, strikeout, text
 +// and underline.
@@ -1058,7 +1082,9 @@ index b452cfa..5e75255 100644
 +//   annot     - handle to an annotation.
 +//   generated - true: not written when the document is saved; false: the
 +//               annotation's own appearance, written when the document is
-+//               saved.
++//               saved (for a text markup annotation whose appearance PDFium
++//               generated, /Rect is then set to the bounds of its quad
++//               points).
 +//
 +// Returns true if successful.
 +FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
