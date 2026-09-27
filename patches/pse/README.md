@@ -76,6 +76,14 @@ view), `CPDF_Annot` generates one, writes it into the annotation dictionary as `
 * `CPDF_Dictionary::WriteTo()` (every save) skips `/AP` and `/PDFIUM_HasGeneratedAP` of a dictionary marked this
   way (`CPDF_Dictionary::HasGeneratedAppearance()`); the key is now `pdfium::annotation::kPDFiumHasGeneratedAP`
   in `constants/annotation_common.h`. The in-memory dictionary is untouched: drawing keeps using the appearance.
+* Generating an ink or text appearance changes `/Rect` (inflated by half the border width / a 20 x 20 icon):
+  `CPDF_Annot` keeps the original `/Rect` in `/PDFIUM_RectBeforeGeneratedAP`, which a save writes as `/Rect`
+  (and never under its own key). Removing the generated appearance (`FPDFAnnot_SetAP(NORMAL, nullptr)`,
+  `FPDFAnnot_SetBorder()`, `FPDFAnnot_SetFontColor()`) restores it, so the next generation starts from the same
+  dictionary instead of inflating an ink annotation again; `FPDFAnnot_SetRect()` drops it (the caller's `/Rect`
+  is saved).
+* Drawing a free text annotation no longer adds an `/AcroForm` to a document that has none, nor a fallback font
+  to the document's `/DR`: the appearance refers to its font directly.
 * The reachable-object traversal of a full save (`GetObjectsWithReferences()`, 0003's `/Info` traversal) does not
   follow such an `/AP`, so the generated streams (and the fonts only they use) are not written either.
   `GetObjectsWithMultipleReferences()` (used by the content generator) still follows it.
@@ -88,4 +96,5 @@ view), `CPDF_Annot` generates one, writes it into the annotation dictionary as `
 A dictionary that already carries the mark when the document is loaded (written by an earlier PDFium-based save)
 is treated the same way: its `/AP` is PDFium's regenerable cache and is not written. New embedder tests:
 `FPDFAnnotEmbedderTest.SaveOmitsGeneratedAppearances`, `.GenerateAPIsSaved`, `.MarkGeneratedAPAndSetAP`,
+`.SaveKeepsRectOfGeneratedInkAppearance`, `.DrawingFreeTextAddsNoAcroForm`,
 `.SaveOmitsGeneratedAppearanceOfNewAnnotation`.
