@@ -83,7 +83,9 @@ view), `CPDF_Annot` generates one, writes it into the annotation dictionary as `
   dictionary instead of inflating an ink annotation again; `FPDFAnnot_SetRect()` drops it (the caller's `/Rect`
   is saved).
 * Drawing a free text annotation no longer adds an `/AcroForm` to a document that has none, nor a fallback font
-  to the document's `/DR`: the appearance refers to its font directly.
+  to the document's `/DR`: the appearance refers to its font directly. `FPDFAnnotEmbedderTest.SetFontColor` relied on
+  that side effect (it read the font colour of a free text without `/DA` from the `/AcroForm` that drawing had added);
+  it now expects no colour until `FPDFAnnot_SetFontColor()` sets one.
 * The reachable-object traversal of a full save (`GetObjectsWithReferences()`, 0003's `/Info` traversal) does not
   follow such an `/AP`, so the generated streams (and the fonts only they use) are not written either.
   `GetObjectsWithMultipleReferences()` (used by the content generator) still follows it.

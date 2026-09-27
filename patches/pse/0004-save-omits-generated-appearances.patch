@@ -485,10 +485,10 @@ index fb5c862..6db29c0 100644
    return true;
  }
 diff --git a/fpdfsdk/fpdf_annot_embeddertest.cpp b/fpdfsdk/fpdf_annot_embeddertest.cpp
-index 059285d..b271c95 100644
+index 059285d..322c496 100644
 --- a/fpdfsdk/fpdf_annot_embeddertest.cpp
 +++ b/fpdfsdk/fpdf_annot_embeddertest.cpp
-@@ -478,6 +478,334 @@ TEST_F(FPDFAnnotEmbedderTest, RenderMultilineMarkupAnnotWithoutAP) {
+@@ -478,6 +478,354 @@ TEST_F(FPDFAnnotEmbedderTest, RenderMultilineMarkupAnnotWithoutAP) {
                                       "annotation_markup_multiline_no_ap");
  }
  
@@ -500,6 +500,14 @@ index 059285d..b271c95 100644
 +
 +bool HasGeneratedAPMark(FPDF_ANNOTATION annot) {
 +  return FPDFAnnot_HasKey(annot, pdfium::annotation::kPDFiumHasGeneratedAP);
++}
++
++// A saved document loaded without a form-fill environment, whose page view
++// would generate appearances for the annotations that have none. `saved` must
++// outlive the document.
++ScopedFPDFDocument LoadWithoutFormFill(const std::string& saved) {
++  return ScopedFPDFDocument(FPDF_LoadMemDocument(
++      saved.data(), static_cast<int>(saved.size()), nullptr));
 +}
 +
 +}  // namespace
@@ -579,21 +587,28 @@ index 059285d..b271c95 100644
 +  }
 +
 +  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
-+  EXPECT_FALSE(
-+      SavedContains(GetString(), pdfium::annotation::kPDFiumHasGeneratedAP));
++  const std::string saved = GetString();
++  EXPECT_FALSE(SavedContains(saved, pdfium::annotation::kPDFiumHasGeneratedAP));
 +
 +  // Only the first annotation has an appearance in the saved document.
++  {
++    ScopedFPDFDocument saved_doc = LoadWithoutFormFill(saved);
++    ASSERT_TRUE(saved_doc);
++    ScopedFPDFPage saved_page(FPDF_LoadPage(saved_doc.get(), 0));
++    ASSERT_TRUE(saved_page);
++    ASSERT_EQ(4, FPDFPage_GetAnnotCount(saved_page.get()));
++    for (int i = 0; i < 4; ++i) {
++      ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(saved_page.get(), i));
++      ASSERT_TRUE(annot);
++      EXPECT_EQ(i == 0,
++                FPDFAnnot_HasKey(annot.get(), pdfium::annotation::kAP));
++      EXPECT_FALSE(HasGeneratedAPMark(annot.get()));
++    }
++  }
 +  ScopedSavedDoc saved_doc = OpenScopedSavedDocument();
 +  ASSERT_TRUE(saved_doc);
 +  ScopedSavedPage saved_page = LoadScopedSavedPage(0);
 +  ASSERT_TRUE(saved_page);
-+  ASSERT_EQ(4, FPDFPage_GetAnnotCount(saved_page.get()));
-+  for (int i = 0; i < 4; ++i) {
-+    ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(saved_page.get(), i));
-+    ASSERT_TRUE(annot);
-+    EXPECT_EQ(i == 0, FPDFAnnot_HasKey(annot.get(), pdfium::annotation::kAP));
-+    EXPECT_FALSE(HasGeneratedAPMark(annot.get()));
-+  }
 +  VerifySavedRenderingWithExpectationSuffix(
 +      saved_page.get(), "annotation_markup_multiline_no_ap");
 +}
@@ -638,12 +653,12 @@ index 059285d..b271c95 100644
 +  // Annotation 2 keeps its generated appearance.
 +
 +  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
-+  EXPECT_FALSE(
-+      SavedContains(GetString(), pdfium::annotation::kPDFiumHasGeneratedAP));
++  const std::string saved = GetString();
++  EXPECT_FALSE(SavedContains(saved, pdfium::annotation::kPDFiumHasGeneratedAP));
 +
-+  ScopedSavedDoc saved_doc = OpenScopedSavedDocument();
++  ScopedFPDFDocument saved_doc = LoadWithoutFormFill(saved);
 +  ASSERT_TRUE(saved_doc);
-+  ScopedSavedPage saved_page = LoadScopedSavedPage(0);
++  ScopedFPDFPage saved_page(FPDF_LoadPage(saved_doc.get(), 0));
 +  ASSERT_TRUE(saved_page);
 +  ASSERT_EQ(4, FPDFPage_GetAnnotCount(saved_page.get()));
 +  for (int i = 0; i < 4; ++i) {
@@ -672,12 +687,13 @@ index 059285d..b271c95 100644
 +
 +  // The save writes the annotations as they were.
 +  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
-+  EXPECT_FALSE(SavedContains(GetString(),
-+                             pdfium::annotation::kPDFiumRectBeforeGeneratedAP));
 +  {
-+    ScopedSavedDoc saved_doc = OpenScopedSavedDocument();
++    const std::string saved = GetString();
++    EXPECT_FALSE(
++        SavedContains(saved, pdfium::annotation::kPDFiumRectBeforeGeneratedAP));
++    ScopedFPDFDocument saved_doc = LoadWithoutFormFill(saved);
 +    ASSERT_TRUE(saved_doc);
-+    ScopedSavedPage saved_page = LoadScopedSavedPage(0);
++    ScopedFPDFPage saved_page(FPDF_LoadPage(saved_doc.get(), 0));
 +    ASSERT_TRUE(saved_page);
 +    for (int i = 0; i < 2; ++i) {
 +      ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(saved_page.get(), i));
@@ -707,7 +723,8 @@ index 059285d..b271c95 100644
 +    // A /Rect set by the caller is saved as it is.
 +    ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), 1));
 +    ASSERT_TRUE(annot);
-+    const FS_RECTF new_rect = {300.0f, 500.0f, 360.0f, 560.0f};
++    // FS_RECTF: left, top, right, bottom.
++    const FS_RECTF new_rect = {300.0f, 560.0f, 360.0f, 500.0f};
 +    ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &new_rect));
 +  }
 +  RenderLoadedPageWithFlags(page.get(), FPDF_ANNOT);
@@ -720,9 +737,10 @@ index 059285d..b271c95 100644
 +  }
 +
 +  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
-+  ScopedSavedDoc saved_doc = OpenScopedSavedDocument();
++  const std::string saved = GetString();
++  ScopedFPDFDocument saved_doc = LoadWithoutFormFill(saved);
 +  ASSERT_TRUE(saved_doc);
-+  ScopedSavedPage saved_page = LoadScopedSavedPage(0);
++  ScopedFPDFPage saved_page(FPDF_LoadPage(saved_doc.get(), 0));
 +  ASSERT_TRUE(saved_page);
 +  {
 +    ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(saved_page.get(), 0));
@@ -749,7 +767,8 @@ index 059285d..b271c95 100644
 +    ScopedFPDFAnnotation annot(
 +        FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
 +    ASSERT_TRUE(annot);
-+    const FS_RECTF rect = {20.0f, 100.0f, 180.0f, 130.0f};
++    // FS_RECTF: left, top, right, bottom.
++    const FS_RECTF rect = {20.0f, 130.0f, 180.0f, 100.0f};
 +    ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
 +    ScopedFPDFWideString da = GetFPDFWideString(L"0 0 1 rg /Helv 12 Tf");
 +    ASSERT_TRUE(FPDFAnnot_SetStringValue(annot.get(), "DA", da.get()));
@@ -793,7 +812,8 @@ index 059285d..b271c95 100644
 +    ScopedFPDFAnnotation annot(
 +        FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_SQUARE));
 +    ASSERT_TRUE(annot);
-+    const FS_RECTF rect = {20.0f, 40.0f, 90.0f, 70.0f};
++    // FS_RECTF: left, top, right, bottom.
++    const FS_RECTF rect = {20.0f, 70.0f, 90.0f, 40.0f};
 +    ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
 +    ASSERT_TRUE(FPDFAnnot_SetColor(annot.get(), FPDFANNOT_COLORTYPE_Color, 0,
 +                                   0, 255, 255));
@@ -823,6 +843,21 @@ index 059285d..b271c95 100644
  TEST_F(FPDFAnnotEmbedderTest, ExtractHighlightLongContent) {
    // Open a file with one annotation and load its first page.
    ASSERT_TRUE(OpenDocument("annotation_highlight_long_content.pdf"));
+@@ -2637,10 +2985,10 @@ TEST_F(FPDFAnnotEmbedderTest, SetFontColor) {
+     unsigned int r = 1;
+     unsigned int g = 2;
+     unsigned int b = 3;
+-    ASSERT_TRUE(FPDFAnnot_GetFontColor(form_handle(), annot.get(), &r, &g, &b));
+-    EXPECT_EQ(0u, r);
+-    EXPECT_EQ(0u, g);
+-    EXPECT_EQ(0u, b);
++    // Neither the annotation nor the document has a default appearance:
++    // drawing the annotation no longer adds an /AcroForm with one.
++    EXPECT_FALSE(
++        FPDFAnnot_GetFontColor(form_handle(), annot.get(), &r, &g, &b));
+ 
+     ASSERT_TRUE(
+         FPDFAnnot_SetFontColor(form_handle(), annot.get(), 60, 120, 180));
 diff --git a/fpdfsdk/fpdf_view_c_api_test.c b/fpdfsdk/fpdf_view_c_api_test.c
 index fee4f4a..24fe23c 100644
 --- a/fpdfsdk/fpdf_view_c_api_test.c
